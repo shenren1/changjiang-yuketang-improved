@@ -1,0 +1,63 @@
+(() => {
+  if (window.__ykhSniff) { console.log('抓包已开启，无需重复运行'); return 'already'; }
+  window.__ykhSniff = true;
+  const T0 = Date.now();
+  const ts = () => ((Date.now() - T0) / 1000).toFixed(1) + 's';
+  const KW = /learn|progress|study|record|report|heartbeat|play|video|courseware|node|log|track|stat|event|behavior/i;
+  const short = (s, n) => { s = s == null ? '' : String(s); return s.length > n ? s.slice(0, n) + '…' : s; };
+  const hit = (u) => typeof u === 'string' && KW.test(u);
+
+  const of = window.fetch;
+  if (of) {
+    window.fetch = function (input, init) {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const method = (init && init.method) || (input && input.method) || 'GET';
+      const body = init && init.body;
+      if (hit(url)) console.log(`[${ts()}] → fetch ${method} ${url}\n    body: ${short(body, 300)}`);
+      const p = of.apply(this, arguments);
+      if (hit(url)) p.then((r) => {
+        try { r.clone().text().then((t) => console.log(`[${ts()}] ← fetch ${r.status} ${short(url, 120)}\n    resp: ${short(t, 500)}`)); } catch (e) {}
+      }).catch((e) => console.log(`[${ts()}] ✗ fetch ${short(url, 120)} ${e}`));
+      return p;
+    };
+  }
+
+  const OX = XMLHttpRequest.prototype.open, SX = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (m, u) { this.__m = m; this.__u = u; return OX.apply(this, arguments); };
+  XMLHttpRequest.prototype.send = function (b) {
+    if (hit(this.__u)) {
+      console.log(`[${ts()}] → xhr ${this.__m} ${this.__u}\n    body: ${short(b, 300)}`);
+      this.addEventListener('load', () => console.log(`[${ts()}] ← xhr ${this.status} ${short(this.__u, 120)}\n    resp: ${short(this.responseText, 500)}`));
+    }
+    return SX.apply(this, arguments);
+  };
+
+  if (navigator.sendBeacon) {
+    const ob = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (u, d) { console.log(`[${ts()}] → beacon ${u}\n    body: ${short(d, 300)}`); return ob(u, d); };
+  }
+
+  const OWS = window.WebSocket;
+  if (OWS) {
+    window.WebSocket = function (u, p) {
+      const ws = p === undefined ? new OWS(u) : new OWS(u, p);
+      console.log(`[${ts()}] → ws 连接 ${u}`);
+      ws.addEventListener('open', () => console.log(`[${ts()}] ws 已连接`));
+      ws.addEventListener('message', (e) => console.log(`[${ts()}] ws ← ${short(typeof e.data === 'string' ? e.data : '[binary]', 300)}`));
+      const os = ws.send.bind(ws);
+      ws.send = function (d) { console.log(`[${ts()}] ws → ${short(typeof d === 'string' ? d : '[binary]', 300)}`); return os(d); };
+      return ws;
+    };
+    window.WebSocket.prototype = OWS.prototype;
+  }
+
+  const v = document.querySelector('video');
+  if (v) {
+    let last = -1;
+    setInterval(() => {
+      if (Math.abs(v.currentTime - last) >= 10) { last = v.currentTime; console.log(`[${ts()}] video t=${v.currentTime.toFixed(1)}/${v.duration.toFixed(1)} paused=${v.paused} ended=${v.ended}`); }
+    }, 1000);
+  }
+  console.log('✅ 抓包已开启：播完一个视频后，把 [xx s] 开头的日志贴给我');
+  return 'ok';
+})();
