@@ -183,7 +183,7 @@ If an exception occurs, check the yk_capture and copy it in the console.
 | 3.0.10 | 禁止向前拖拽式跳转，未完成视频改为从头连续播放 |
 | 3.0.11 | 修复脚本自身反复写倍速导致的闪动 |
 | 3.0.12 | 平台上报队列（`nhd`）看门狗：解决“播完不打钩 / 完成度不涨” |
-
+后续改动在MODIFIED.md中说明,此处不再说明
 > 完整改动记录（含每条改动的根因、代码位置与测试）：见 **`MODIFIED.md`**。
 
 ---

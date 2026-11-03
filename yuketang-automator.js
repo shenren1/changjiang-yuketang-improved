@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         长江雨课堂自动刷课助手
 // @namespace    https://changjiang.yuketang.cn/
-// @version      3.0.12
+// @version      3.0.13
 // @description  自动刷视频、做试题，支持倍速播放与AI智能答题（判断题全文本回退）
 // @author       yuketang-helper
 // @match        https://changjiang.yuketang.cn/*
@@ -154,6 +154,50 @@
     static setAISettings(ai) {
       Storage.set('aiSettings', { ...Storage.getAISettings(), ...ai });
     }
+  }
+
+  // ============================================================
+  //  NH QUEUE SLIM — 平台上报队列(localStorage['nhd'])瘦身
+  // ============================================================
+  /**
+   * 把平台的上报队列“只丢掉最旧的一部分”，保留最新的 keepRatio 比例。
+   * 背景：雨课堂把观看心跳先写进 localStorage['nhd']，写满后 setItem 抛
+   * QuotaExceededError，平台自己没兜住，之后所有事件全部静默丢弃。
+   * 整条清空能救回上报链路，但会连带丢掉还没发出去的进度事件，导致
+   * “视频都播完了，覆盖率却永远差一截”。所以优先做“删旧保新”。
+   *
+   * @param {string} raw 原始 localStorage 字符串
+   * @param {number} keepRatio 保留比例（0~1），默认 0.6
+   * @returns {string|null} 瘦身后的字符串；解析不了或没变短则返回 null
+   */
+  function trimNhQueue(raw, keepRatio = 0.6) {
+    if (typeof raw !== 'string' || raw.length < 2) return null;
+    const ratio = Math.min(0.9, Math.max(0.1, keepRatio));
+
+    const shrink = (arr) => {
+      const keep = Math.max(1, Math.floor(arr.length * ratio));
+      return arr.slice(arr.length - keep);
+    };
+
+    try {
+      const data = JSON.parse(raw);
+      if (Array.isArray(data)) {
+        const out = JSON.stringify(shrink(data));
+        return out.length < raw.length ? out : null;
+      }
+      if (data && typeof data === 'object') {
+        for (const key of ['events', 'list', 'data', 'queue', 'logs', 'heart_data']) {
+          if (Array.isArray(data[key])) {
+            data[key] = shrink(data[key]);
+            const out = JSON.stringify(data);
+            return out.length < raw.length ? out : null;
+          }
+        }
+      }
+    } catch (e) {
+      // 不是 JSON（极少见）：交给调用方整条清空
+    }
+    return null;
   }
 
   // ============================================================
@@ -1602,8 +1646,11 @@ ${formatInst}
       const muted = this.ui.isMuted();
 
       this._muteViaPlatform();
-      video.muted = muted;
-      video.volume = muted ? 0 : 1;
+      // 只在需要时赋值：反复把 muted/volume 设成同一个值也会触发 volumechange，
+      // 平台的埋点会把这些事件记进 nhd 队列，白白把队列撑满（撑满后上报全丢）。
+      if (video.muted !== muted) video.muted = muted;
+      const wantVol = muted ? 0 : 1;
+      if (Math.abs((video.volume === undefined ? 1 : video.volume) - wantVol) > 0.01) video.volume = wantVol;
       this._applySpeed(video);
 
       if (!video._ykhEventsBound) {
@@ -1618,7 +1665,8 @@ ${formatInst}
         });
         video.addEventListener('seeked', () => {
           if (this.isHandling) {
-            video.muted = this.ui.isMuted();
+            const m = this.ui.isMuted();
+            if (video.muted !== m) video.muted = m;
             this._applySpeed(video);
           }
         });
@@ -1717,7 +1765,8 @@ ${formatInst}
       }
       if (this._awaitingNextVideo) return;
 
-      video.muted = this.ui.isMuted();
+      const muted = this.ui.isMuted();
+      if (video.muted !== muted) video.muted = muted;
       this._applySpeed(video);
 
       // 已经在播：什么都不做（旧实现在这里会点按钮 = 点暂停）
@@ -5877,6 +5926,8 @@ ${formatInst}
       this._jumping = false;         // 跳转中，防止主循环重入
       this._awaitingSince = 0;       // 进入"等待下一个视频"状态的时间戳
       this._reportTimer = null;      // 平台上报队列(nhd)看门狗
+      this._nhdSize = 0;             // 上次看到的 nhd 队列字节数（诊断用）
+      this._nhdWarned = false;       // 是否已经提示过队列堆积
     }
 
     init() {
@@ -6024,9 +6075,11 @@ ${formatInst}
     _startReportWatchdog() {
       this._stopReportWatchdog();
       const KEY = 'nhd';
-      const LIMIT = 300 * 1024;   // 约 300KB，超过就认为它卡住了
+      const SOFT = 1024 * 1024;       // 1MB：只提示，不动数据
+      const HARD = 2 * 1024 * 1024;   // 2MB：接近配额，才做“删旧保新”
 
-      // 1) 写失败时：清掉旧队列再重试一次，让这批事件能排进去、能被发出去
+      // 1) 写失败时：不是整条清空，而是“删旧保新”再重试一次。
+      //    整条清空会连带丢掉还没发出去的进度事件 → 覆盖率永远差一截。
       try {
         if (!window.__ykhStoragePatched) {
           window.__ykhStoragePatched = true;
@@ -6036,11 +6089,18 @@ ${formatInst}
               return orig.call(this, k, v);
             } catch (e) {
               if (k === KEY) {
-                try { localStorage.removeItem(KEY); } catch (e2) {}
+                let slim = null;
+                try { slim = trimNhQueue(localStorage.getItem(KEY), 0.5); } catch (e1) {}
                 try {
-                  logger.warn('System', '平台上报队列 nhd 写满，已清理并重试（否则观看进度不上报）');
-                  return orig.call(this, k, v);
-                } catch (e3) {}
+                  if (slim) {
+                    localStorage.setItem(KEY, slim);
+                    logger.warn('System', `平台上报队列 nhd 写满，已丢弃最旧部分只保留最新的（${Math.round(slim.length / 1024)}KB）后重试`);
+                  } else {
+                    localStorage.removeItem(KEY);
+                    logger.warn('System', '平台上报队列 nhd 写满且无法瘦身，已整条清理后重试（会丢掉少量未上报进度）');
+                  }
+                } catch (e2) {}
+                try { return orig.call(this, k, v); } catch (e3) {}
               }
               throw e;
             }
@@ -6051,10 +6111,24 @@ ${formatInst}
       const check = () => {
         try {
           const v = localStorage.getItem(KEY);
-          if (v && v.length > LIMIT) {
-            localStorage.removeItem(KEY);
-            logger.warn('System', `平台上报队列 nhd 堆积 ${Math.round(v.length / 1024)}KB（会导致观看进度不上报），已清理`);
-            this.ui.log('⚠️ 平台上报队列已满，已自动清理（否则观看进度不计入）', 'warn');
+          if (!v) { this._nhdSize = 0; return; }
+          const kb = Math.round(v.length / 1024);
+          this._nhdSize = v.length;
+          if (v.length > HARD) {
+            const slim = trimNhQueue(v, 0.6);
+            if (slim) {
+              localStorage.setItem(KEY, slim);
+              logger.warn('System', `平台上报队列 nhd 已达 ${kb}KB（配额上限附近），已丢弃最旧部分保留最新 60%（${Math.round(slim.length / 1024)}KB）`);
+              this.ui.log(`⚠️ 平台上报队列 ${kb}KB 接近上限，已清理最旧部分（保留最新），避免进度不再上报`, 'warn');
+            } else {
+              localStorage.removeItem(KEY);
+              logger.warn('System', `平台上报队列 nhd 已达 ${kb}KB 且无法瘦身，已整条清理`);
+              this.ui.log('⚠️ 平台上报队列已满，已自动清理（否则观看进度不计入）', 'warn');
+            }
+            this._nhdWarned = true;
+          } else if (v.length > SOFT && !this._nhdWarned) {
+            this._nhdWarned = true;
+            logger.warn('System', `平台上报队列 nhd 已堆积 ${kb}KB（平台自身不清理会一直涨），超过 2MB 时会自动清理最旧部分`);
           }
         } catch (e) {}
       };

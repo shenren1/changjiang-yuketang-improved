@@ -3,11 +3,11 @@ Based on original project: https://github.com/yu-xi-qin/-/blob
 
 # MODIFIED — 长江雨课堂自动刷课助手 改动记录
 
-> **基线版本**：v3.0.0（用户桌面原版，5711 行，CRLF）
-> **当前版本**：v3.0.12（6394 行，与 `yk3.js` 工作副本逐字节一致）
-> **改动统计**：`+789 / −106` 行，28 个改动块（不含行尾 CRLF→LF 的归一化）
-> **部署位置**：`C:\Users\24249\Desktop\yuketang-automator.js`
-> **说明**：本文按“版本 → 现象 → 根因 → 具体改动”记录，行号均指 **v3.0.12** 文件中的位置。
+> **基线版本**：v3.0.0（最初的原版脚本，5711 行，CRLF）
+> **当前版本**：v3.0.13（6468 行，与 `yk3.js` 工作副本逐字节一致）
+> **改动统计**：`+866 / −109` 行，29 个改动块（不含行尾 CRLF→LF 的归一化）
+> **部署形式**：Tampermonkey 脚本（单个 `.js`，文件名 `yuketang-automator.js`）
+> **说明**：本文按“版本 → 现象 → 根因 → 具体改动”记录，行号均指 **v3.0.13** 文件中的位置。
 
 ---
 
@@ -16,7 +16,7 @@ Based on original project: https://github.com/yu-xi-qin/-/blob
 | 版本 | 触发问题 | 核心改动 | 现状 |
 |---|---|---|---|
 | 3.0.0 | — | 原始基线 | 已被覆盖（有备份） |
-| 3.0.1 | 闪动 | 用户自行给 1 秒重试加完成标记判断 | 逻辑被 3.0.5 重写继承 |
+| 3.0.1 | 闪动 | 给 1 秒重试补了完成标记判断 | 逻辑被 3.0.5 重写继承 |
 | 3.0.2 | 播完不跳下一个 | 「视频刚结束」分支前置 + `_jumpNextTask` + 目录点击跳转 | 保留 |
 | 3.0.3 | 3.0.2 点不到目录行 | 按真实 DOM 重写目录选择器（`.nav-item-leaf-box` 等） | 保留 |
 | 3.0.4 | 起播时暂停/播放反复闪 | 播放按钮只点一次 + 4 次/4 秒熔断 15 秒 | 保留（3.0.11 加强） |
@@ -28,6 +28,7 @@ Based on original project: https://github.com/yu-xi-qin/-/blob
 | 3.0.10 | 3.0.9 让进度彻底不动 | 禁止一切向前 seek；未打钩且过半 → 拖回 0 秒从头连续播放 | 保留 |
 | 3.0.11 | 起播仍闪 + 控制台刷 AbortError | **真凶是脚本自己每 500ms 写 `playbackRate`**；加写入锁 + 启动保护期 | 保留 |
 | 3.0.12 | 播完只记 2%~12%、不打钩 | `localStorage['nhd']` 上报队列满后平台静默丢事件 → 加看门狗清理 | 保留 |
+| 3.0.13 | 进度能涨但永远到不了 ~90% | 3.0.12 的看门狗**整条清空** `nhd`，把在途未上报的进度一起删了 → 改为“删旧保新” | 保留 |
 
 ---
 
@@ -51,7 +52,7 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 
 ## 2. 逐版本改动
 
-### v3.0.1 
+### v3.0.1 — 手动补丁
 `_smartPlay` 播放失败后的 1 秒延迟重试增加完成标记判断，避免这 1 秒内刚被判完成的视频被拉回 0 秒重播。
 > 该次重试逻辑在 v3.0.5 被 `_tryStart`/`_scheduleTryStart` 整体重写，语义由「次数上限 + 退避」继续保证。
 
@@ -78,7 +79,7 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 
 **根因**：参考的第三方脚本选择器（`.leaf-detail`、`[data-leaf-id]`）与站点实际 DOM 不符。
 
-**改动**（依据用户导出的真实 DOM）：
+**改动**（依据实测导出的真实 DOM）：
 - `_catalogLeaves()`（4796）改用 `.nav-item-leaf-box`，并用 `getClientRects().length > 0` 过滤隐藏行；
 - 新增 `_leafTag/_leafTitle/_leafDone`（4802/4808/4814）：类型读 `.leaf-item-tag`，标题读 `.leaf-item-title`，完成判定＝`.leaf-item-status` 内存在 `i, svg`；
 - `_currentLeafIndex()`（4821）改用 `.leaf-item.is-active`，退路才是 `data-leaf-id === node_id`；
@@ -177,6 +178,24 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 - ① 一次性 patch `Storage.prototype.setItem`（`window.__ykhStoragePatched` 防重复）：当 `k === 'nhd'` 且抛错时 → 清空 `nhd` → **重试一次**，日志 `平台上报队列 nhd 写满，已清理并重试（否则观看进度不上报）`；
 - ② 每 30 秒体检：`nhd` 超过 `300KB` 就主动清理并提示 `⚠️ 平台上报队列已满，已自动清理（否则观看进度不计入）`。
 
+**验证**：实测「现在进度在涨了」→ 根因确认。
+
+### v3.0.13 — 队列“删旧保新”（进度卡在 80~90% 上不去）
+
+**现象**：3.0.12 之后进度确实开始涨了，但**怎么都到不了 ~90%**，明明每个视频都播完了；目录仍不打钩。
+
+**根因**：
+- 服务端把视频判为完成的阈值在 **95% 左右**（早前抓包：`last_point 515/540`、`rate 0.9556` 时 `completed` 才从 `0` 变 `1`）；
+- 3.0.12 的看门狗一旦发现 `nhd` 超 300KB（或 `setItem` 抛配额错误），就 **`removeItem('nhd')` 整条删掉**——队列里**还没发出去**的进度事件也跟着没了；
+- 队列在被反复清空 → 每清一次就丢一小段观看进度 → 覆盖率永远差最后几个百分点，卡死在 80~90%。
+
+**改动**：
+- 新增顶层纯函数 `trimNhQueue(raw, keepRatio = 0.6)`：解析队列 JSON，**只保留最新的 60% 事件**（数组直接 `slice` 尾部；对象则在 `events/list/data/queue/logs/heart_data` 里找数组字段裁剪），`keepRatio` 夹在 0.1~0.9；解析失败或没变短则返回 `null`，交给调用方整条清理兜底；
+- `_startReportWatchdog()` 重写为两级阈值：`SOFT = 1MB` 只记一条 warn（`_nhdWarned` 只提示一次）不清理；`HARD = 2MB` 才 `trimNhQueue(v, 0.6)` + `setItem` 写回，失败再整条清理；
+- `setItem` patch 里的配额错误改为 `trimNhQueue(getItem, 0.5)` **删旧保新后重试**，日志 `平台上报队列 nhd 写满，已丢弃最旧部分只保留最新的（…KB）后重试`；只有裁剪也失败时才 `已整条清理后重试（会丢掉少量未上报进度）`；
+- 同时**减少脚本自己制造的事件**：`setupVideo()` / `_smartPlay()` / `seeked` 里给 `video.muted`、`video.volume` 赋值前都先判断值是否真的不同——Chrome 对同值赋值也可能派发 `volumechange`，而平台会把这类事件记进 `nhd`，白白把队列撑满。
+
+**验证**：`yk3-test-nhd.js` 9 项全过（数组保留尾部 60%、至少留 1 条、`{events}`/`{heart_data}` 只裁该字段、非 JSON 不抛、ratio 夹取、真实心跳 200→120 条且字段完整）。
 
 ---
 
@@ -207,11 +226,12 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 | `_jumpNextTask(force)` | Automator | 6190 | 跳转编排：防重入、失败计数、冷却、重新接管 |
 | `_startReportWatchdog()` | Automator | 6024 | `nhd` 队列看门狗（含 setItem patch） |
 | `_stopReportWatchdog()` | Automator | 6065 | 停止看门狗 |
+| `trimNhQueue(raw, 0.6)` | 顶层函数 | 173 | `nhd` 队列瘦身：解析后只保留最新 N%，失败返回 null |
 
 ### 新增状态字段
 
 **VideoHandler**：`_finishedEl`、`_finishedSrc`、`_awaitingNextVideo`、`_endedAt`、`_scanScheduled`、`_platformSpeedLocked`、`_speedWarned`、`_speedVideo`、`_speedWriteAt`、`_speedCheckTimer`、`_startVideo`、`_startAttempts`、`_startRetryAt`、`_retryTimer`、`_pauseTimes`、`_btnClickBlockedUntil`、`_lastBtnClickAt`、`_graceUntil`、`_lastPos`、`_ykhRestarted`（元素级）。
-**Automator**：`_navFailCount`、`_jumping`、`_awaitingSince`、`_reportTimer`。
+**Automator**：`_navFailCount`、`_jumping`、`_awaitingSince`、`_reportTimer`、`_nhdSize`、`_nhdWarned`。
 
 ---
 
@@ -256,8 +276,9 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 | 平台缺陷 | 表现 | 脚本对策 |
 |---|---|---|
 | `nhd` 队列写满后静默丢弃上报 | 播完只记几十秒、永远不打钩 | 3.0.12 看门狗：写失败即清理重试 + 30 秒体检清理 |
+| 清理时整条清空 `nhd` | 进度能涨但卡在 80~90% 上不去 | 3.0.13 `trimNhQueue()` 删旧保新（保留最新 60%）+ 两级阈值（1MB 提示 / 2MB 动手） |
 | 拖拽跳过的片段算“未观看” | 用插件跑过就再也不打钩 | 全文禁止一切向前 seek；只允许“拖回 0 秒从头连续播放” |
-| 倍速限制（改写 `playbackRate`） | 脚本设 2.0x 被改回 0.8x | 3.0.7 检测并锁定，不再硬顶，提示用户调回 1.0x |
+| 倍速限制（改写 `playbackRate`） | 脚本设 2.0x 被改回 0.8x | 3.0.7 检测并锁定，不再硬顶，并提示调回 1.0x |
 | 目录 ✓ / 完成度只在刷新时拉取 | 跑的时候进度条不动，误以为没生效 | 属正常现象；判断是否打钩必须刷新后看 |
 
 ---
@@ -277,20 +298,20 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 
 ## 7. 部署与回滚
 
-**部署**（每次）：改 `yk3.js` → `node --check` → 跑三套测试 → 改 `@version` → `cp` 备份 → `cp` 覆盖桌面 → `cmp` 校验。
+**部署**（每次）：改 `yk3.js` → `node --check` → 跑三套测试 → 改 `@version` → `cp` 备份 → `cp` 覆盖目标脚本 → `cmp` 校验。
 
-**现存可回滚副本**（桌面历史上每次部署前都生成过 `.bak-<时间>`，但旧文件已不在桌面上，目前只剩最后一个）：
+**现存可回滚副本**（每次部署前都会生成一份 `.bak-<时间>`，较早的已被清理，目前仅剩最后一个）：
 
-| 位置 | 文件 | 版本 |
+| 类型 | 文件 | 版本 |
 |---|---|---|
-| 桌面 | `yuketang-automator.js.bak-20261103-200716` | 3.0.11（3.0.12 之前的版本） |
-| 工作区 `_versions/` | `yuketang-3.0.0.js` | 3.0.0（最原始基线，CRLF） |
-| 工作区 `_versions/` | `yuketang-3.0.11.js` | 3.0.11 |
-| 工作区 `_versions/` | `yuketang-3.0.12.js` | 3.0.12（当前） |
+| 部署前自动备份 | `yuketang-automator.js.bak-20261104-0005` | 3.0.12（3.0.13 之前的版本） |
+| 归档副本 | `yuketang-3.0.0.js` | 3.0.0（最原始基线，CRLF） |
+| 归档副本 | `yuketang-3.0.11.js` | 3.0.11 |
+| 归档副本 | `yuketang-3.0.13.js` | 3.0.13（当前） |
 
 > 3.0.1 ~ 3.0.10 的中间版本没有留存副本；如需其中某一版，我可以按本文记录逐条重新生成。
 
-**回滚**：把对应副本重命名为 `yuketang-automator.js` 覆盖桌面文件，再在 Tampermonkey 里重新粘贴内容、刷新页面。
+**回滚**：把对应副本重命名为 `yuketang-automator.js` 覆盖目标脚本，再在 Tampermonkey 里重新粘贴内容、刷新页面。
 
 ---
 
