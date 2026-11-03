@@ -177,7 +177,6 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 - ① 一次性 patch `Storage.prototype.setItem`（`window.__ykhStoragePatched` 防重复）：当 `k === 'nhd'` 且抛错时 → 清空 `nhd` → **重试一次**，日志 `平台上报队列 nhd 写满，已清理并重试（否则观看进度不上报）`；
 - ② 每 30 秒体检：`nhd` 超过 `300KB` 就主动清理并提示 `⚠️ 平台上报队列已满，已自动清理（否则观看进度不计入）`。
 
-**验证**：用户实测「现在进度在涨了」→ 根因确认。
 
 ---
 
@@ -303,14 +302,3 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 4. 目录树若改版，优先更新 `.nav-item-leaf-box` / `.leaf-item-*` / `icon-yuanquangou-mianzhuang` 这几处，其余逻辑不受影响。
 
 ---
-
-## 附录：诊断脚本清单（`D:\deepseek_chat_record\dsh\会话二\`）
-
-| 文件 | 用途 |
-|---|---|
-| `sniff-yuketang.js` | 全量抓包：fetch / XHR / sendBeacon / WebSocket，按 `video-log|heartbeat` 等关键词过滤 |
-| `diag-finish.js` | v1：抓单视频进度 + 课程进度接口 |
-| `diag-finish2.js` | v2：加 beacon 拦截、饼图解析、ended 快照、12s/30s 复查 |
-| `diag-finish3.js` | v3：只看上报链路，`__ykhDump()` 一键导出（含 `nhd` 体积与配额异常） |
-| `diag-check.js` | 播放器/DOM 环境自检 |
-| `diag-leaf.js` | 课程进度接口探测（用于确认 XTBZ 签名限制） |
