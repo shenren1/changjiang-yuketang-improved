@@ -4,10 +4,10 @@ Based on original project: https://github.com/yu-xi-qin/-/blob
 # MODIFIED — 长江雨课堂自动刷课助手 改动记录
 
 > **基线版本**：v3.0.0（最初的原版脚本，5711 行，CRLF）
-> **当前版本**：v3.0.13（6468 行，与 `yk3.js` 工作副本逐字节一致）
-> **改动统计**：`+866 / −109` 行，29 个改动块（不含行尾 CRLF→LF 的归一化）
+> **当前版本**：v3.0.18（6894 行，与 `yk3.js` 工作副本逐字节一致）
+> **改动统计**：`+1294 / −111` 行，29 个改动块（不含行尾 CRLF→LF 的归一化）
 > **部署形式**：Tampermonkey 脚本（单个 `.js`，文件名 `yuketang-automator.js`）
-> **说明**：本文按“版本 → 现象 → 根因 → 具体改动”记录，行号均指 **v3.0.13** 文件中的位置。
+> **说明**：本文按“版本 → 现象 → 根因 → 具体改动”记录，行号均指 **v3.0.18** 文件中的位置。
 
 ---
 
@@ -29,6 +29,11 @@ Based on original project: https://github.com/yu-xi-qin/-/blob
 | 3.0.11 | 起播仍闪 + 控制台刷 AbortError | **真凶是脚本自己每 500ms 写 `playbackRate`**；加写入锁 + 启动保护期 | 保留 |
 | 3.0.12 | 播完只记 2%~12%、不打钩 | `localStorage['nhd']` 上报队列满后平台静默丢事件 → 加看门狗清理 | 保留 |
 | 3.0.13 | 进度能涨但永远到不了 ~90% | 3.0.12 的看门狗**整条清空** `nhd`，把在途未上报的进度一起删了 → 改为“删旧保新” | 保留 |
+| 3.0.14 | 面板改倍速无效 | 3.0.7 的「被改一次就永久锁定」改为「一分钟内最多纠正 12 次，超限安静 1 分钟」 | 保留 |
+| 3.0.15 | 倍速仍被页面压回 0.8x | 在 `<video>` 实例上改写 `playbackRate` 存取器，setter 一律落成面板值 | 被 3.0.18 加强 |
+| 3.0.16 | 覆盖率永远到不了 95% | 读 `/video-log/detail/` 的 `heartbeat.result`，按「已观看区间」补缺口 | 保留（3.0.17 修正） |
+| 3.0.17 | 3.0.16 的补播从未执行 | 直连接口取区间；接管视频时就核对，读不到才退回「拖回 0 秒」 | 保留 |
+| 3.0.18 | 页面绕过实例锁抢写倍速 | 原型 setter 强写 + `ratechange` 自愈 + 可见日志 | **当前版本** |
 
 ---
 
@@ -199,39 +204,150 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 
 ---
 
+### v3.0.14 — 面板改倍速无效（永久锁定改为有限纠正）
+
+**现象**：面板选 1.5x，实际一直是 0.8x。3.0.7 之后每进一次视频页，倍速就再也调不动。
+
+**根因**：3.0.7 的 `_applySpeed()` 在写完 1.2 秒后回读，一旦发现值被改，就置 `_platformSpeedLocked = true`；而该方法开头有一句「已锁定就直接 return」。于是**页面只要成功压一次，脚本就永久放弃**——这是自己把自己焊死的典型。
+
+**改动**：
+- 删除“永久锁定”语义，换成三件套记数：`_speedFight`（一分钟窗口内已纠正次数）、`_speedFightStart`（窗口起点）、`_speedQuietUntil`（安静期截止）；
+- 一分钟内最多纠正 12 次；超限只安静 **1 分钟**（`_speedQuietUntil = now + 60000`），并且只 warn 一次 `平台持续把倍速改回 Xx（脚本设置 Yx），暂停纠正 1 分钟后再试`；
+- 回读发现被改时把 `_speedWriteAt = 0`，允许**立刻**再纠一轮，而不是干等 2 秒限流窗口；
+- `updateSpeed()` 里清空计数与安静期：面板一动就重新开始争取。
+
+**验证**：`yk3-test-play.js` 两条用例改写为「被改回后脚本再纠正且不报警」「用尽次数后静默且只警告一次」。
+
+---
+
+### v3.0.15 — 实例级倍速锁
+
+**现象**：3.0.14 之后倍速依然调不动。控制台 `ratechange` 实验（初始 0.8x，脚本写 1.5x）显示：**+0.1 秒页面改成 1.0，+0.5 秒改成 0.8，之后 0.8↔1.0 每 0.3~0.5 秒来回跳几十次**，永远回不到 1.5。
+
+**根因**：页面自己有倍速同步逻辑，不停覆写 `video.playbackRate`；脚本改一次它改回去，谁最后写谁说话。
+
+**改动**：新增 `_installRateOverride(video)`：取 `HTMLMediaElement.prototype` 上 `playbackRate` 的原始描述符，在 `<video>` **实例**上用 `Object.defineProperty` 换成自己的 getter/setter，setter 一律把值落成 `_wantRate`（面板值）；`_ykhRateHooked` 防重复安装。`setupVideo()` 中顺序改为：`this._wantRate = speed` → `_installRateOverride(video)` → `_applySpeed(video)`。
+
+**效果与局限**：页面读到的是真实值，但它怎么写都等于面板值，`ratechange` 不再刷屏（顺带消除了起播闪烁的一个诱因）。**局限**：只拦「正常赋值」，页面若拿原型描述符 `desc.set.call(video, 0.8)` 直接写就能绕过——3.0.18 才补上这一点。
+
+**验证**：`yk3-test-play.js` 加 4 项（装上锁读到真值 / 页面改写被抹平 / 面板改速仍生效 / 页面再改依然生效）。
+
+---
+
+### v3.0.16 — 按「已观看区间」补播缺口
+
+**现象**：视频都播完、目录仍然不打钩；右上「完成度」卡在 46%~77%。
+
+**根因**：平台判完成看的是**覆盖区间**，不是「是否播到结尾」。点开视频右上「完成度 → 详情」看到的「观看日志」就是这条数据：一条蓝灰分段条（蓝＝已观看、灰＝未观看）。抓包证明它来自：
+
+```
+GET /video-log/detail/?classroom_id=…&user_id=…&video_id=…
+```
+
+```json
+{"rate":0.7713,"video_length":516.0,"completed":0,
+ "result":[{"s":0,"e":34},{"s":115,"e":165},{"s":197,"e":222},{"s":229,"e":518}]}
+```
+
+`heartbeat.result` 是已观看区间（秒），`rate = 区间总长 ÷ video_length`（上面 398/516 = 77.13%），缺口为 34~115、165~197、222~229 共约 120 秒；`completed` 要覆盖率接近 100% 才会变 1。
+
+**改动**：新增一整套覆盖率逻辑，核心是「只补缺口，不从头重放」：
+- `_computeGaps(result, length)`：区间先合并（含首尾相接），再取补集，**小于 3 秒的空隙忽略**（播放器抖动，补了也没意义）；
+- `_playSpan(video, a, b)`：seek 到 `a+0.5` → `play()` → 轮询到 `b-0.3` 跳出，**中途绝不暂停**（暂停会产生断点，反而让区间碎片化）；
+- `fillGaps()`：读区间 → 算缺口 → 逐段补播 → 补完重新读一次区间确认；
+- `seeking` 监听里加 `this._gapSeeking` 豁免：补播自己的 seek 不报「拖拽」警告。
+
+**验证**：新建 `yk3-test-coverage.js` 13 项。
+
+---
+
+### v3.0.17 — 让补播真正跑起来
+
+**现象**：3.0.16 部署后毫无变化，控制台里看不到任何「读取区间/补播」的迹象。
+
+**根因**（两条，缺一都不会执行）：
+1. `setupVideo()` 里 3.0.10 留下的「未打钩且停在一半之后 → 拖回 0 秒从头播」**先执行并 return**，而覆盖率核对只在「视频播完」分支里才有机会跑 → 永远走不到；
+2. 读区间依赖点击「详情」按钮，失败只打 `debug` 级日志，控制台默认看不见 → 表现为“什么都没发生”。
+
+**改动**：
+- **直连接口**：`classroom_id` / `video_id` 从地址栏 `/lms-graph/<classroom>/video/<video>` 正则解析；`user_id` 从 `performance.getEntriesByType('resource')` 里带 `user_id=` 的 URL 捞；`fetch(url, {credentials:'include'})` 直接读 `heartbeat`，不再依赖点按钮；
+- **三级读取**：60 秒缓存 → 直连 → 点「详情」+ 钩 `XHR/fetch` 截获；三路都失败才提示，且失败原因全部走高可见日志（`读覆盖率失败：找不到 user_id` 等）；
+- `fillGaps()` 返回值改为状态字符串：`filled`（补播过）/ `done`（本来不缺）/ `unknown`（读不到）/ `skip`（未运行或重入）；
+- **接管视频时就核对**：`setupVideo()` 里先提示 `🔎 上次没打钩、停在 X%，正在读取未观看区间…`，1.5 秒后读区间并只补缺口；只有返回 `unknown` 才退回老办法「拖回 0 秒从头连续播放」。
+
+**验证**：`yk3-test-coverage.js` 扩到 16 项（新增地址栏解析、直连解析 `heartbeat`、直连失败返回 null）；`yk3-test-video.js` 的“停在结尾”用例改为「先不动位置 → 读不到区间才拖回 0」。
+
+---
+
+### v3.0.18 — 倍速：原型级强写 + 事件自愈
+
+**现象**：3.0.15~3.0.17 之后倍速还是调不动。
+
+**根因**：
+1. 实例锁只拦正常赋值，页面若用原型描述符 `desc.set.call(video, 0.8)` 直接写就绕过去了；
+2. `updateSpeed()` 里写的是 `video.playbackRate = speed`，这行会经过实例锁的 setter，而 setter 用**旧的 `_wantRate`** 覆盖 → 面板改速等于没改（这是个真 bug，测试里抓到的）。
+
+**改动**：
+- 新增 `_enforceRate(video)`：直接用原型上的原始 setter 写 `ui.getSpeed()`，绕过一切拦截；每次调用先同步 `_wantRate`，返回是否真的纠正过；
+- `<video>` 上监听 `ratechange`：实际值与面板值不符（说明被绕过了）就立刻 `_enforceRate()` 按回；
+- `ensurePlaying()` 每轮调 `_enforceRate()`，不再只做 `video.playbackRate !== speed` 的只读比较；
+- `updateSpeed()` 改为用原型 setter 写所有 video（含同源 iframe）；
+- 新增可见日志：`页面试图把倍速改成 Xx，已保持面板值 Yx`、`倍速被改成 Xx，已强制改回 Yx`（2 秒节流）。
+
+**验证**：`yk3-test-play.js` 41 项，新增「绕过实例锁后 `_enforceRate` 按回面板值」「面板改速用原型 setter 也生效」「页面再抢写仍被按回 2.0」。
+
+---
+
 ## 3. 新增方法总表
 
 | 方法 | 所属类 | 行号 | 作用 |
 |---|---|---|---|
-| `_findPlayableVideo()` | VideoHandler | 1558 | 主文档 + 同源 iframe 中找第一个未播完的 video |
-| `_isFinishedVideo(v)` | VideoHandler | 1571 | 判断元素是否已播完（含 SPA 换源后自动失效） |
-| `_isNewVideo(v)` | VideoHandler | 1582 | 判断是否为新视频（元素/换源/已移除） |
-| `_applySpeed(video)` | VideoHandler | 1678 | 安全写倍速：值相同不写、2 秒限流、回读检测平台改写 |
-| `_tryStart(video)` | VideoHandler | 1736 | 启动播放：先 `play()`，失败退避重试 |
-| `_scheduleTryStart(video, delay)` | VideoHandler | 1767 | 延迟重试调度，≥3 次才点按钮，>6 次停手 |
-| `_findPlayButton()` | VideoHandler | 1789 | 找平台播放按钮（含可见性过滤） |
-| `_clickPlatformPlayButton()` | VideoHandler | 1811 | 只发一次 `click`，2 秒冷却 |
-| `_currentLeafDone()` | VideoHandler | 1852 | 当前目录行是否已打钩 |
-| `_playerRoot()` | VideoHandler | 1865 | 定位播放器容器 |
-| `_getProgressText()` | VideoHandler | 1876 | 只在播放器内读进度文本 |
-| `_nodeIdFromUrl()` | NavigationHandler | 4776 | 从 URL 取 `node_id` |
-| `_catalogLeaves()` | NavigationHandler | 4796 | 目录树所有可见行 |
-| `_leafTag/_leafTitle/_leafDone` | NavigationHandler | 4802/4808/4814 | 行的类型/标题/是否完成 |
-| `_currentLeafIndex(leaves)` | NavigationHandler | 4821 | 当前行下标（`.leaf-item.is-active`） |
-| `_didNavigate(urlBefore, mediaBefore)` | NavigationHandler | 4834 | SPA 下判断是否真的换了内容 |
-| `_clickNextInCatalog()` | NavigationHandler | 4842 | 目录树里点下一个未完成任务 |
-| `_clickPlayerNext()` | NavigationHandler | 4889 | 点播放器“下一节”按钮 |
-| `_clickNextByText()` | NavigationHandler | 4939 | 按文本找“下一节/下一个”兜底 |
-| `goToNextTask()` | NavigationHandler | 4985 | 四级跳转策略入口 |
-| `_jumpNextTask(force)` | Automator | 6190 | 跳转编排：防重入、失败计数、冷却、重新接管 |
-| `_startReportWatchdog()` | Automator | 6024 | `nhd` 队列看门狗（含 setItem patch） |
-| `_stopReportWatchdog()` | Automator | 6065 | 停止看门狗 |
+| `_findPlayableVideo()` | VideoHandler | 1623 | 主文档 + 同源 iframe 中找第一个未播完的 video |
+| `_isFinishedVideo(v)` | VideoHandler | 1636 | 判断元素是否已播完（含 SPA 换源后自动失效） |
+| `_isNewVideo(v)` | VideoHandler | 1647 | 判断是否为新视频（元素/换源/已移除） |
+| `_applySpeed(video)` | VideoHandler | 2111 | 安全写倍速：值相同不写、2 秒限流、回读检测平台改写 |
+| `_tryStart(video)` | VideoHandler | 2180 | 启动播放：先 `play()`，失败退避重试 |
+| `_scheduleTryStart(video, delay)` | VideoHandler | 2211 | 延迟重试调度，≥3 次才点按钮，>6 次停手 |
+| `_findPlayButton()` | VideoHandler | 2233 | 找平台播放按钮（含可见性过滤） |
+| `_clickPlatformPlayButton()` | VideoHandler | 2255 | 只发一次 `click`，2 秒冷却 |
+| `_currentLeafDone()` | VideoHandler | 2296 | 当前目录行是否已打钩 |
+| `_playerRoot()` | VideoHandler | 2309 | 定位播放器容器 |
+| `_getProgressText()` | VideoHandler | 2320 | 只在播放器内读进度文本 |
+| `_nodeIdFromUrl()` | NavigationHandler | 5230 | 从 URL 取 `node_id` |
+| `_catalogLeaves()` | NavigationHandler | 5250 | 目录树所有可见行 |
+| `_leafTag/_leafTitle/_leafDone` | NavigationHandler | 5256/5262/5268 | 行的类型/标题/是否完成 |
+| `_currentLeafIndex(leaves)` | NavigationHandler | 5275 | 当前行下标（`.leaf-item.is-active`） |
+| `_didNavigate(urlBefore, mediaBefore)` | NavigationHandler | 5288 | SPA 下判断是否真的换了内容 |
+| `_clickNextInCatalog()` | NavigationHandler | 5296 | 目录树里点下一个未完成任务 |
+| `_clickPlayerNext()` | NavigationHandler | 5343 | 点播放器“下一节”按钮 |
+| `_clickNextByText()` | NavigationHandler | 5393 | 按文本找“下一节/下一个”兜底 |
+| `goToNextTask()` | NavigationHandler | 5439 | 四级跳转策略入口 |
+| `_jumpNextTask(force)` | Automator | 6688 | 跳转编排：防重入、失败计数、冷却、重新接管 |
+| `_startReportWatchdog()` | Automator | 6484 | `nhd` 队列看门狗（含 setItem patch） |
+| `_stopReportWatchdog()` | Automator | 6548 | 停止看门狗 |
 | `trimNhQueue(raw, 0.6)` | 顶层函数 | 173 | `nhd` 队列瘦身：解析后只保留最新 N%，失败返回 null |
+| `_installRateOverride(video)` | VideoHandler | 1777 | 在 `<video>` 实例上锁 `playbackRate`，setter 落成面板值 |
+| `_logRateWrite(v, want)` | VideoHandler | 1806 | 页面抢写倍速时打可见日志（2 秒节流） |
+| `_enforceRate(video)` | VideoHandler | 1820 | 用原型 setter 强写面板倍速，返回是否纠正过 |
+| `_currentVideoId()` | VideoHandler | 1846 | 当前视频 id（取自地址栏） |
+| `_videoInfo()` | VideoHandler | 1851 | 从 `/lms-graph/<c>/video/<v>` 解析 classroomId / videoId |
+| `_resourceUrls()` | VideoHandler | 1861 | 收集页面已发出的请求 URL（performance 资源） |
+| `_classroomId()` / `_userId()` | VideoHandler | 1868 / 1876 | 从请求 URL 里取 `classroom_id` / `user_id` |
+| `_installCoverageHook()` | VideoHandler | 1885 | 钩 XHR/fetch，截获 `/video-log/detail/` 响应 |
+| `_findDetailButton()` | VideoHandler | 1934 | 找「详情」（`SPAN.log-detail`）按钮 |
+| `_fetchCoverageDirect()` | VideoHandler | 1953 | 直连 `/video-log/detail/` 取 `heartbeat` |
+| `readCoverage(timeoutMs)` | VideoHandler | 1983 | 三级读取：缓存 → 直连 → 点详情截获 |
+| `_computeGaps(result, length)` | VideoHandler | 2016 | 已观看区间合并后取补集（<3 秒忽略） |
+| `fillGaps(videoOverride)` | VideoHandler | 2044 | 按缺口补播，返回 `filled/done/unknown/skip` |
+| `_playSpan(video, a, b)` | VideoHandler | 2084 | 连续播完 [a,b] 这一段，中途不暂停 |
 
 ### 新增状态字段
 
-**VideoHandler**：`_finishedEl`、`_finishedSrc`、`_awaitingNextVideo`、`_endedAt`、`_scanScheduled`、`_platformSpeedLocked`、`_speedWarned`、`_speedVideo`、`_speedWriteAt`、`_speedCheckTimer`、`_startVideo`、`_startAttempts`、`_startRetryAt`、`_retryTimer`、`_pauseTimes`、`_btnClickBlockedUntil`、`_lastBtnClickAt`、`_graceUntil`、`_lastPos`、`_ykhRestarted`（元素级）。
+**VideoHandler**：`_finishedEl`、`_finishedSrc`、`_awaitingNextVideo`、`_endedAt`、`_scanScheduled`、`_speedWarned`、`_speedVideo`、`_speedWriteAt`、`_speedCheckTimer`、`_speedFight`、`_speedFightStart`、`_speedQuietUntil`、`_wantRate`、`_rateDesc`、`_ratePageWrites`、`_rateLogAt`、`_startVideo`、`_startAttempts`、`_startRetryAt`、`_retryTimer`、`_pauseTimes`、`_btnClickBlockedUntil`、`_lastBtnClickAt`、`_graceUntil`、`_lastPos`、`_ykhRestarted`（元素级）。
+**覆盖率相关**：`_coverageHooked`、`_coverageByVideo`（按 video_id 缓存）、`_coverageAt`、`_coverageSeq`、`_gapFilling`、`_gapSeeking`、`_gapCheckedFor`、`_gapAttempts`。
 **Automator**：`_navFailCount`、`_jumping`、`_awaitingSince`、`_reportTimer`、`_nhdSize`、`_nhdWarned`。
+
+> 3.0.14 起 `_platformSpeedLocked` 已删除（那正是“倍速永久调不动”的元凶）。
 
 ---
 
@@ -263,7 +379,8 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 | 接口 | 说明 |
 |---|---|
 | `POST /video-log/heartbeat/` | 观看心跳，body 含 `heart_data[]`（`cp` 当前点、`d` 时长、`et` 事件类型） |
-| `GET /video-log/get_video_watch_progress/` | 单视频观看进度 |
+| `GET /video-log/get_video_watch_progress/` | 单视频观看进度（响应体字段名与预期不符，解析常为 `{}`） |
+| `GET /video-log/detail/?classroom_id=&user_id=&video_id=` | **已观看区间**：`heartbeat.result` 为 `[{s,e},…]`，`rate`＝覆盖度，`video_length` 为总时长，`completed` 见 100% 才置 1；带 cookie 即可直连 |
 | `GET /mooc-api/v1/lms/learn/course/schedule?...` | `leaf_schedules`：`1`=完成、`0`=未完成、小数=部分 |
 | `GET /c27/online_courseware/schedule/course/progress/?classroom_id=` | 课程进度（`section_leaf_list[].progress.status`） |
 
@@ -278,48 +395,18 @@ new MutationObserver(() => this.scanAndHandle())                       // 无节
 | `nhd` 队列写满后静默丢弃上报 | 播完只记几十秒、永远不打钩 | 3.0.12 看门狗：写失败即清理重试 + 30 秒体检清理 |
 | 清理时整条清空 `nhd` | 进度能涨但卡在 80~90% 上不去 | 3.0.13 `trimNhQueue()` 删旧保新（保留最新 60%）+ 两级阈值（1MB 提示 / 2MB 动手） |
 | 拖拽跳过的片段算“未观看” | 用插件跑过就再也不打钩 | 全文禁止一切向前 seek；只允许“拖回 0 秒从头连续播放” |
-| 倍速限制（改写 `playbackRate`） | 脚本设 2.0x 被改回 0.8x | 3.0.7 检测并锁定，不再硬顶，并提示调回 1.0x |
+| 播放器反复改写 `playbackRate` | 脚本设 2.0x，页面 0.3~0.5 秒就改回 0.8x/1.0x | 3.0.15 实例级锁 → 3.0.18 原型 setter 强写 + `ratechange` 自愈（面板改速立即生效） |
+| 完成判定看「覆盖区间」而非「播到结尾」 | 视频全播完仍 `rate` 46%~77%、`completed` 一直 0 | 3.0.16/3.0.17 读 `/video-log/detail/` 的 `result` 区间，**只补缺口**，不从头重放 |
 | 目录 ✓ / 完成度只在刷新时拉取 | 跑的时候进度条不动，误以为没生效 | 属正常现象；判断是否打钩必须刷新后看 |
 
 ---
 
-## 6. 测试
+## 6. 已知遗留 / 观察项
 
-三个 Node 假环境测试（不依赖浏览器），从源文件截取类代码后用 `new Function` 注入桩对象执行：
-
-| 文件 | 用例数 | 覆盖内容 |
-|---|---|---|
-| `yk3-test-video.js` | 12 | 视频接管、结束后不重播、等待跳转态、SPA 换源、未打钩时拖回开头从头播放、已打钩不重播、结束后绝不 seek |
-| `yk3-test-play.js` | 28 | 启动流程、`AbortError` 退避、按钮点击次数上限、平台倍速改写检测、已同倍速不重复写、启动保护期忽略 pause |
-| `yk3-test-nav.js` | 10 | 目录定位（`.is-active`）、跳到下一个未完成视频、跳过已完成、末尾返回 false、优先视频后作业、✓ 图标识别 |
-| **合计** | **50** | 全部通过 |
-
----
-
-## 7. 部署与回滚
-
-**部署**（每次）：改 `yk3.js` → `node --check` → 跑三套测试 → 改 `@version` → `cp` 备份 → `cp` 覆盖目标脚本 → `cmp` 校验。
-
-**现存可回滚副本**（每次部署前都会生成一份 `.bak-<时间>`，较早的已被清理，目前仅剩最后一个）：
-
-| 类型 | 文件 | 版本 |
-|---|---|---|
-| 部署前自动备份 | `yuketang-automator.js.bak-20261104-0005` | 3.0.12（3.0.13 之前的版本） |
-| 归档副本 | `yuketang-3.0.0.js` | 3.0.0（最原始基线，CRLF） |
-| 归档副本 | `yuketang-3.0.11.js` | 3.0.11 |
-| 归档副本 | `yuketang-3.0.13.js` | 3.0.13（当前） |
-
-> 3.0.1 ~ 3.0.10 的中间版本没有留存副本；如需其中某一版，我可以按本文记录逐条重新生成。
-
-**回滚**：把对应副本重命名为 `yuketang-automator.js` 覆盖目标脚本，再在 Tampermonkey 里重新粘贴内容、刷新页面。
-
----
-
-## 8. 已知遗留 / 观察项
-
-1. **`playbackRate` 观测值常为 0.8x**：面板设 1.0 的情况下也被压到 0.8，尚未定论（可能是播放器某状态默认值，也可能是平台的降速处理）。若之后出现“进度涨得很慢”，可把起播行为做得更像真人：不静音、不从中间起播、偶发自然停顿。
-2. **`get_video_watch_progress` 返回体字段名**与预期（`completed/last_point/rate/duration`）不符，历史抓包里解析出 `{}`；若需再深挖要先打印原始 JSON。
-3. 文件保存后**行尾由 CRLF 变为 LF**（Node 读写导致），Tampermonkey 无影响。
-4. 目录树若改版，优先更新 `.nav-item-leaf-box` / `.leaf-item-*` / `icon-yuanquangou-mianzhuang` 这几处，其余逻辑不受影响。
+1. **`playbackRate` 为什么被压到 0.8x 仍未定论**：3.0.18 已能强制按回面板值（`ratechange` 自愈 + 原型 setter 强写），但平台为何盯着 0.8 还没查清——可能是播放器某状态的默认值，也可能是有意的降速风控。若之后又出现“调不动”，先看控制台有没有 `倍速被改成 …x，已强制改回 …x`，有就说明页面仍在抢写，可再升级为全局原型级锁。
+2. **覆盖率补播的副作用**：补缺口属于「向后跳一次再连续播」，平台对“拖拽”敏感，但补的是**未观看片段**、跳的是**已观看片段**，实测覆盖率会持续上涨；若某视频一直补不满，多半是 `video_length` 与实际时长有细微差异，可放宽 `_computeGaps` 的 3 秒容差。
+3. **`get_video_watch_progress` 返回体字段名**与预期（`completed/last_point/rate/duration`）不符，历史抓包里解析出 `{}`；若需再深挖要先打印原始 JSON。
+4. 文件保存后**行尾由 CRLF 变为 LF**（Node 读写导致），Tampermonkey 无影响。
+5. 目录树若改版，优先更新 `.nav-item-leaf-box` / `.leaf-item-*` / `icon-yuanquangou-mianzhuang` 这几处，其余逻辑不受影响。
 
 ---

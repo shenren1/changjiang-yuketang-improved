@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         长江雨课堂自动刷课助手
 // @namespace    https://changjiang.yuketang.cn/
-// @version      3.0.13
+// @version      3.0.18
 // @description  自动刷视频、做试题，支持倍速播放与AI智能答题（判断题全文本回退）
 // @author       yuketang-helper
 // @match        https://changjiang.yuketang.cn/*
@@ -1447,11 +1447,23 @@ ${formatInst}
       this._startRetryAt = 0;           // 下次允许重试的时间
       this._retryTimer = null;          // 启动重试定时器
       this._speedWarned = false;        // 是否已提示过“平台限制了倍速”
-      this._platformSpeedLocked = false; // 平台限制了倍速后，不再硬顶
+      this._wantRate = 0;               // 期望倍速（倍速锁的取值来源，0 = 还没设定）
+      this._rateDesc = null;            // HTMLMediaElement.prototype.playbackRate 的原始描述符
+      this._ratePageWrites = 0;         // 页面抢写倍速的次数（诊断用）
+      this._rateLogAt = 0;              // 倍速日志节流
+      this._speedQuietUntil = 0;        // 平台持续压制倍速时的静默截止时间（不是永久放弃）
+      this._speedFight = 0;             // 当前这一分钟里纠正倍速的次数
+      this._speedFightStart = 0;        // 计数窗口起点（60 秒）
       this._speedCheckTimer = null;     // 倍速被平台改写的检测定时器
       this._speedVideo = null;          // 上次写过倍速的 video
       this._speedWriteAt = 0;           // 上次写倍速的时间（限流：同一视频 2 秒内只写一次）
       this._graceUntil = 0;             // 启动保护期：新视频接管后的这段时间内不响应 pause 重试
+      this._coverageHooked = false;     // 是否已钩住页面的 XHR/fetch（用于截获观看区间）
+      this._coverageByVideo = {};       // video_id -> heartbeat（含 result 已观看区间）
+      this._coverageAt = {};            // video_id -> 读取时间
+      this._coverageSeq = 0;            // 截获到的响应条数（用于等待）
+      this._gapFilling = false;         // 是否正在补播缺口
+      this._gapSeeking = false;         // 是否正在做补播用的 seek（不报警）
     }
 
     start() {
@@ -1471,9 +1483,14 @@ ${formatInst}
       this._startAttempts = 0;
       this._startRetryAt = 0;
       this._speedWarned = false;
-      this._platformSpeedLocked = false;
+      this._speedQuietUntil = 0;
+      this._speedFight = 0;
+      this._speedFightStart = 0;
       if (this._speedCheckTimer) { clearTimeout(this._speedCheckTimer); this._speedCheckTimer = null; }
       if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+      this._gapFilling = false;
+      this._gapSeeking = false;
+      this._coverageSeq = 0;
       this.scanAndHandle();
       this.observeVideoChanges();
       this.watchInterval = setInterval(() => this.scanAndHandle(), CONFIG.videoCheckInterval);
@@ -1500,9 +1517,13 @@ ${formatInst}
       this._startAttempts = 0;
       this._startRetryAt = 0;
       this._speedWarned = false;
-      this._platformSpeedLocked = false;
+      this._speedQuietUntil = 0;
+      this._speedFight = 0;
+      this._speedFightStart = 0;
       if (this._speedCheckTimer) { clearTimeout(this._speedCheckTimer); this._speedCheckTimer = null; }
       if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+      this._gapFilling = false;
+      this._gapSeeking = false;
     }
 
     // 静音守护：每500ms检查一次（前2分钟），之后每3秒检查
@@ -1651,6 +1672,8 @@ ${formatInst}
       if (video.muted !== muted) video.muted = muted;
       const wantVol = muted ? 0 : 1;
       if (Math.abs((video.volume === undefined ? 1 : video.volume) - wantVol) > 0.01) video.volume = wantVol;
+      this._wantRate = speed;
+      this._installRateOverride(video);   // 先上锁，再写倍速（否则写进去也会被页面立刻改回）
       this._applySpeed(video);
 
       if (!video._ykhEventsBound) {
@@ -1662,6 +1685,17 @@ ${formatInst}
           this._playAttempts = 0;
           this._startAttempts = 0;
           this._startRetryAt = 0;
+        });
+        // 页面一旦把倍速改掉（绕过实例锁的写法），立刻按回面板值
+        video.addEventListener('ratechange', () => {
+          const want = this._wantRate;
+          if (!(want > 0)) return;
+          let cur = 0;
+          try { cur = video.playbackRate; } catch (e) { return; }
+          if (Math.abs(cur - want) > 0.05) {
+            this._logRateWrite(cur, want);
+            this._enforceRate(video);
+          }
         });
         video.addEventListener('seeked', () => {
           if (this.isHandling) {
@@ -1677,6 +1711,7 @@ ${formatInst}
           if (!this.isHandling) return;
           const from = this._lastPos || 0;
           const to = video.currentTime;
+          if (this._gapSeeking) { this._lastPos = to; return; }   // 补播缺口的 seek 是我们自己的，不报警
           if (to - from > 5) {
             logger.warn('Video', `检测到进度被往后拖拽 ${(to - from).toFixed(0)} 秒，被跳过的片段会被平台算作未观看`);
             this.ui.log(`⚠️ 进度被拖拽 +${Math.round(to - from)}s，跳过的那段会算未观看（可能一直不打钩）`, 'warn');
@@ -1693,9 +1728,18 @@ ${formatInst}
           video.currentTime > 5 && video.currentTime > video.duration * 0.5) {
         video._ykhRestarted = true;
         const pct = Math.round((video.currentTime / video.duration) * 100);
-        try { video.currentTime = 0; } catch (e) {}
-        logger.info('Video', `该视频未打钩且停在 ${pct}%，拖回 0 秒从头连续播放（拖拽跳过会被算作未观看）`);
-        this.ui.log(`↩️ 上次没打钩、停在 ${pct}%，已拖回开头从头连续播放`, 'warn');
+        logger.info('Video', `该视频未打钩且停在 ${pct}%，先按服务端的未观看区间补播`);
+        this.ui.log(`🔎 上次没打钩、停在 ${pct}%，正在读取未观看区间…`, 'warn');
+        // 先问服务端要「已观看区间」，只补没看过的部分；读不到才退回从头连续播。
+        setTimeout(async () => {
+          const state = await this.fillGaps(video);
+          if (state === 'unknown' && this.isHandling) {
+            try { video.currentTime = 0; } catch (e) {}
+            logger.info('Video', '读不到观看区间，退回从头连续播放');
+            this.ui.log('↩️ 读不到观看区间，已拖回开头从头连续播放', 'warn');
+          }
+        }, 1500);
+        return;   // 补播由 fillGaps 接管播放，这里不再 _smartPlay
       }
 
       // 启动保护期：刚接管视频的 2 秒内，播放器/平台自己会完成“恢复进度 + 就绪 + 起播”，
@@ -1718,22 +1762,374 @@ ${formatInst}
     }
 
     /**
-     * 设置倍速，并检测“平台把我的倍速改掉了”。
-     * 雨课堂在检测到倍速播放时会把 playbackRate 压回 <1x（常见 0.8），
-     * 这时平台通常不再计入有效学习时长，目录里就不会打钩。
-     * 只能提示用户，不能硬顶：硬顶就是脚本和播放器互相抢。
+     * 【3.0.15】锁死倍速：直接改写这个 <video> 实例的 playbackRate 存取器。
+     *
+     * 取证结论（2026-11-04 浏览器控制台实测）：页面自身的代码在以 0.3~0.5 秒的周期
+     * 反复把 playbackRate 在 0.8 和 1.0 之间来回改（ratechange 事件刷屏）。
+     * 只要“我们改一下它立刻改回去”，面板上的倍速就永远调不动 —— 这是
+     * 「调倍速后实际倍速并没有改变」的真正原因。
+     *
+     * 做法：把实例上的 playbackRate 换成自己的 getter/setter——
+     *   setter 一律落成 `_wantRate`（面板选的倍速），页面每次改写都被抹平；
+     *   实际值不再变化，也就不会再有 ratechange 事件刷屏（顺带消除了暂停闪烁的诱因）。
+     * 页面读 playbackRate 读到的是真实值，但它自己的 UI 文字可能不同步（无功能影响）。
+     */
+    _installRateOverride(video) {
+      if (!video || video._ykhRateHooked) return;
+      let desc = null;
+      try {
+        desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
+      } catch (e) { return; }
+      if (!desc || !desc.get || !desc.set) return;
+      const self = this;
+      video._ykhRateHooked = true;
+      this._rateDesc = desc;   // 留着：强制纠正时绕过所有 monkey patch 直接写真实值
+      try {
+        Object.defineProperty(video, 'playbackRate', {
+          configurable: true,
+          enumerable: true,
+          get() { return desc.get.call(video); },
+          set(v) {
+            const want = (typeof self._wantRate === 'number' && self._wantRate > 0) ? self._wantRate : v;
+            self._ratePageWrites = (self._ratePageWrites || 0) + 1;
+            if (Math.abs(Number(v) - want) > 0.01) self._logRateWrite(v, want);
+            try { desc.set.call(video, want); } catch (e) {}
+          },
+        });
+        logger.debug('Video', '已锁定倍速：页面再也改不动它，只有面板能改');
+      } catch (e) {
+        logger.debug('Video', '倍速锁定安装失败: ' + e.message);
+      }
+    }
+
+    /** 页面改写倍速时打一条「看得见」的日志（2 秒节流），用来定位到底是谁在压倍速 */
+    _logRateWrite(v, want) {
+      const nowMs = Date.now();
+      if (nowMs - (this._rateLogAt || 0) < 2000) return;
+      this._rateLogAt = nowMs;
+      logger.info('Video', `页面试图把倍速改成 ${v}x，已保持面板值 ${want}x`);
+    }
+
+    /**
+     * 【3.0.18】强制把倍速写回面板值，返回是否真的纠正了。
+     *
+     * 和实例 setter 的区别：这里直接用原型上的原始 setter 写，
+     * 因此即使页面绕过实例 setter（拿着原型描述符 desc.set.call、
+     * 或在别的时机抢写），也照样会被按回面板值。
+     */
+    _enforceRate(video) {
+      if (!video) return false;
+      let want = 0;
+      try { want = this.ui.getSpeed(); } catch (e) { want = this._wantRate || 0; }
+      if (!(want > 0)) return false;
+      this._wantRate = want;
+      let cur = NaN;
+      try {
+        cur = this._rateDesc ? this._rateDesc.get.call(video) : video.playbackRate;
+      } catch (e) { cur = video.playbackRate; }
+      if (typeof cur === 'number' && Math.abs(cur - want) > 0.05) {
+        try {
+          if (this._rateDesc) this._rateDesc.set.call(video, want);
+          else video.playbackRate = want;
+        } catch (e) {}
+        logger.info('Video', `倍速被改成 ${cur}x，已强制改回 ${want}x`);
+        return true;
+      }
+      return false;
+    }
+
+    // ───────────── 观看覆盖率（已观看区间）与缺口补播 ─────────────
+    // 平台把「已观看区间」记在 /video-log/detail/ 的 heartbeat.result 里：
+    //   { rate: 0.7713, video_length: 516, result: [{s:0,e:34},{s:115,e:165},…] }
+    // rate = 区间总长 / video_length，也就是右上角「详情 → 观看日志」那条蓝灰分段的原始数据。
+    // 只有把缺口段补齐、让 rate 接近 1，课程才算完成（目录才打钩）。
+    _currentVideoId() {
+      return this._videoInfo().videoId;
+    }
+
+    /** 从地址栏解析 classroom_id / video_id：/lms-graph/26433346/video/47998673 */
+    _videoInfo() {
+      if (typeof location === 'undefined') return { classroomId: '', videoId: '' };
+      const p = location.pathname + location.search;
+      const m = /(?:lms-graph|lms)\/(\d+)\/video\/(\d+)/.exec(p);
+      if (m) return { classroomId: m[1], videoId: m[2] };
+      const v = /\/video\/(\d+)/.exec(p);
+      return { classroomId: this._classroomId(), videoId: v ? v[1] : '' };
+    }
+
+    /** 页面自己的请求里带着 classroom_id / user_id，直接从 performance 里捞。 */
+    _resourceUrls() {
+      const urls = [];
+      try { urls.push(location.href); } catch (e) {}
+      try { performance.getEntriesByType('resource').forEach((e) => urls.push(e.name)); } catch (e) {}
+      return urls;
+    }
+
+    _classroomId() {
+      for (const u of this._resourceUrls()) {
+        const m = /[?&]classroom_id=(\d+)/.exec(u);
+        if (m) return m[1];
+      }
+      return '';
+    }
+
+    _userId() {
+      for (const u of this._resourceUrls()) {
+        const m = /[?&]user_id=(\d+)/.exec(u);
+        if (m) return m[1];
+      }
+      return '';
+    }
+
+    /** 钩住页面的 XHR/fetch，截获「详情」接口的响应（我们自己发的请求可能缺签名头）。 */
+    _installCoverageHook() {
+      if (this._coverageHooked) return;
+      this._coverageHooked = true;
+      const self = this;
+      let W = (typeof window !== 'undefined') ? window : globalThis;
+      try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) W = unsafeWindow; } catch (e) {}
+      const grab = (url, text) => {
+        if (!url || url.indexOf('/video-log/detail/') < 0 || !text) return;
+        try {
+          const j = JSON.parse(text);
+          const hb = j && j.data && j.data.heartbeat;
+          if (!hb || !Array.isArray(hb.result)) return;
+          const vid = String(j.data.video_id || '');
+          self._coverageByVideo[vid] = hb;
+          self._coverageSeq += 1;
+          logger.debug('Video', `已读到观看区间：覆盖率 ${(Number(hb.rate) * 100).toFixed(1)}%，${hb.result.length} 段`);
+        } catch (e) { /* 不是 JSON 就忽略 */ }
+      };
+      try {
+        const XHR = W.XMLHttpRequest;
+        if (XHR && XHR.prototype && !XHR.prototype.__ykhCoverage) {
+          XHR.prototype.__ykhCoverage = true;
+          const origOpen = XHR.prototype.open;
+          const origSend = XHR.prototype.send;
+          XHR.prototype.open = function (m, u) { this.__ykhUrl = u; return origOpen.apply(this, arguments); };
+          XHR.prototype.send = function () {
+            this.addEventListener('load', function () {
+              try { grab(this.__ykhUrl, this.responseText); } catch (e) {}
+            });
+            return origSend.apply(this, arguments);
+          };
+        }
+      } catch (e) {}
+      try {
+        const origFetch = W.fetch;
+        if (typeof origFetch === 'function' && !origFetch.__ykhCoverage) {
+          origFetch.__ykhCoverage = true;
+          W.fetch = function (input) {
+            const url = (typeof input === 'string') ? input : (input && input.url);
+            const p = origFetch.apply(this, arguments);
+            try {
+              p.then((resp) => { resp.clone().text().then((t) => grab(url, t)).catch(() => {}); }).catch(() => {});
+            } catch (e) {}
+            return p;
+          };
+        }
+      } catch (e) {}
+    }
+
+    _findDetailButton() {
+      const sels = ['.log-detail', 'span.log-detail', '[class*="log-detail"]'];
+      for (const s of sels) {
+        const el = document.querySelector(s);
+        if (el && el.getClientRects().length > 0) return el;
+      }
+      // 选择器兜不住时按文字找：右上角「完成度 46% 详情」里的那个小字
+      try {
+        const all = document.querySelectorAll('span, a, button, div, i');
+        for (const el of all) {
+          if (el.children && el.children.length) continue;
+          const t = (el.textContent || '').trim();
+          if (t === '详情' && el.getClientRects().length > 0) return el;
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    /** 直接请求 /video-log/detail/（页面自己调过这个接口，带 cookie 就能拿到数据）。 */
+    async _fetchCoverageDirect() {
+      const info = this._videoInfo();
+      const uid = this._userId();
+      if (!info.videoId) { logger.info('Video', '读覆盖率失败：地址栏里没有 video_id'); return null; }
+      if (!info.classroomId) { logger.info('Video', '读覆盖率失败：找不到 classroom_id'); return null; }
+      if (!uid) { logger.info('Video', '读覆盖率失败：找不到 user_id'); return null; }
+      const url = `/video-log/detail/?classroom_id=${info.classroomId}&user_id=${uid}&video_id=${info.videoId}`;
+      let W = (typeof window !== 'undefined') ? window : globalThis;
+      try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) W = unsafeWindow; } catch (e) {}
+      const doFetch = (W && typeof W.fetch === 'function') ? W.fetch.bind(W) : fetch;
+      try {
+        const resp = await doFetch(url, { credentials: 'include', headers: { Accept: 'application/json, text/plain, */*' } });
+        const txt = await resp.text();
+        let j = null;
+        try { j = JSON.parse(txt); } catch (e) {}
+        const hb = j && j.data && j.data.heartbeat;
+        if (hb && Array.isArray(hb.result)) {
+          this._coverageByVideo[info.videoId] = hb;
+          this._coverageAt[info.videoId] = Date.now();
+          logger.info('Video', `直连读到观看区间：覆盖率 ${(Number(hb.rate) * 100).toFixed(1)}%，${hb.result.length} 段`);
+          return hb;
+        }
+        logger.info('Video', `直连 /video-log/detail/ 没有 heartbeat：${(txt || '').slice(0, 160)}`);
+      } catch (e) {
+        logger.info('Video', '直连 /video-log/detail/ 失败: ' + (e && e.message));
+      }
+      return null;
+    }
+
+    /** 读取观看覆盖率：先直连接口，失败再点「详情」靠钩子截获。读不到返回 null。 */
+    async readCoverage(timeoutMs = 6000) {
+      const vid = this._currentVideoId();
+      if (vid && this._coverageByVideo[vid] && Date.now() - (this._coverageAt[vid] || 0) < 60000) {
+        return this._coverageByVideo[vid];
+      }
+      const direct = await this._fetchCoverageDirect();
+      if (direct) return direct;
+
+      this._installCoverageHook();
+      const btn = this._findDetailButton();
+      if (!btn) {
+        logger.info('Video', '读覆盖率失败：页面上找不到「详情」按钮');
+        this.ui.log('⚠️ 找不到「详情」按钮，无法读取观看区间', 'warn');
+        return null;
+      }
+      const seq = this._coverageSeq;
+      try {
+        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      } catch (e) {}
+      const deadline = Date.now() + timeoutMs;
+      while (this.isHandling && Date.now() < deadline && this._coverageSeq === seq) await DOM.sleep(200);
+      // 关掉详情弹层，别挡住播放器
+      try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (e) {}
+      const hb = vid ? this._coverageByVideo[vid] : null;
+      if (hb) { this._coverageAt[vid] = Date.now(); return hb; }
+      logger.info('Video', '读覆盖率失败：点了「详情」但没有截获到 /video-log/detail/ 响应');
+      this.ui.log('⚠️ 点击「详情」后没读到观看区间', 'warn');
+      return null;
+    }
+
+    /** 已观看区间 → 未观看缺口（补播用）。返回 [[start,end],…]，单位秒。 */
+    _computeGaps(result, length) {
+      const len = Number(length) || 0;
+      if (!Array.isArray(result) || !(len > 0)) return [];
+      const spans = result
+        .map((r) => [Math.max(0, Number(r.s) || 0), Math.min(len, Number(r.e) || 0)])
+        .filter((p) => p[1] > p[0])
+        .sort((a, b) => a[0] - b[0]);
+      const merged = [];
+      for (const p of spans) {
+        const last = merged[merged.length - 1];
+        if (last && p[0] <= last[1] + 1) last[1] = Math.max(last[1], p[1]);
+        else merged.push([p[0], p[1]]);
+      }
+      const gaps = [];
+      let cursor = 0;
+      for (const sp of merged) {
+        if (sp[0] - cursor >= 3) gaps.push([cursor, sp[0]]);
+        cursor = Math.max(cursor, sp[1]);
+      }
+      if (len - cursor >= 3) gaps.push([cursor, len]);
+      return gaps;
+    }
+
+    /**
+     * 按缺口补播未观看片段。
+     * 返回值：'filled'＝补播过（调用方应再等平台重新结算）／'done'＝本来就不缺／
+     *        'unknown'＝读不到观看区间（调用方可以退回“从头连续播”）／'skip'＝没在跑或重入。
+     */
+    async fillGaps(videoOverride) {
+      if (this._gapFilling) return 'skip';
+      const video = videoOverride || this._finishedEl || this.currentVideo;
+      if (!video) return 'skip';
+      this._gapFilling = true;
+      try {
+        const hb = await this.readCoverage();
+        if (!hb) { logger.info('Video', '读不到观看区间，本次不补播'); return 'unknown'; }
+        const rate = Number(hb.rate) || 0;
+        if (Number(hb.completed) === 1 || rate >= 0.995) {
+          logger.info('Video', `覆盖率 ${(rate * 100).toFixed(1)}%，无需补播`);
+          return 'done';
+        }
+        const len = Number(hb.video_length) || video.duration || 0;
+        const gaps = this._computeGaps(hb.result, len);
+        if (!gaps.length) {
+          logger.info('Video', `覆盖率 ${(rate * 100).toFixed(1)}%，算不出缺口（可能只差末尾几秒），交给平台结算`);
+          return 'done';
+        }
+        const desc = gaps.map((g) => `${g[0].toFixed(0)}-${g[1].toFixed(0)}s`).join('、');
+        logger.warn('Video', `覆盖率只有 ${(rate * 100).toFixed(1)}%，未观看 ${gaps.length} 段：${desc}，开始补播`);
+        this.ui.log(`🔧 覆盖率 ${(rate * 100).toFixed(1)}%，开始补播 ${gaps.length} 段未观看内容`, 'warn');
+        // 允许再次播放这个「已结束」的视频
+        this._awaitingNextVideo = false;
+        this.currentVideo = video;
+        video._ykhFinished = false;
+        this._applySpeed(video);
+        for (const g of gaps) {
+          if (!this.isHandling) return 'skip';
+          await this._playSpan(video, g[0], g[1]);
+        }
+        this.ui.log('✅ 未观看区间已补播，等待平台重新计算覆盖率', 'info');
+        await DOM.sleep(3000);
+        return 'filled';
+      } finally {
+        this._gapFilling = false;
+      }
+    }
+
+    /** 从 a 秒播到 b 秒（含端点），中途不暂停，播完就跳下一段。 */
+    async _playSpan(video, a, b) {
+      if (!video) return;
+      this._gapSeeking = true;
+      try { video.currentTime = Math.max(0, a + 0.5); } catch (e) {}
+      try { await video.play(); } catch (e) {}
+      this._gapSeeking = false;
+      const endAt = Math.max(a + 1, b - 0.3);
+      const spanMin = (b - a) / Math.max(0.5, Number(video.playbackRate) || 1) / 60;
+      const deadline = Date.now() + Math.max(20000, spanMin * 60000 * 2 + 20000);
+      while (this.isHandling && Date.now() < deadline) {
+        await DOM.sleep(500);
+        if (video.ended && video.currentTime + 0.5 >= b) break;
+        if (video.paused) { try { await video.play(); } catch (e) {} }
+        if (video.currentTime >= endAt) break;
+      }
+    }
+
+    /**
+     * 设置倍速；被播放器改回去就再纠正一次（有限次退让，不是永久放弃）。
+     *
+     * 三个约束，缺一个就会出问题：
+     *  1. 绝不重复写同一个值 —— 反复赋值会不停触发 ratechange，播放器会当成
+     *     “倍速作弊”把视频暂停，脚本再拉起 → 就是之前那个“暂停/播放反复闪烁”。
+     *  2. 每次纠正后 1.2 秒回读：值被改回就重来，但一分钟内最多纠正 12 次；
+     *  3. 超过次数就先安静 1 分钟（不是永久锁定）—— 旧版 3.0.7~3.0.13 在这里
+     *     永久 `_platformSpeedLocked = true`，于是“面板改成 1.5x，实际一直是 0.8x”。
      */
     _applySpeed(video) {
       if (!video) return;
-      if (this._platformSpeedLocked) return;   // 平台已强行限制倍速：不再硬顶，避免和播放器互抢
       const want = this.ui.getSpeed();
-      // 【3.0.11 关键】绝不重复写同一个值：
-      // 反复给 playbackRate 赋值会不停触发 ratechange 事件，雨课堂播放器会把这当成
-      // 异常行为（倍速作弊）把播放暂停；脚本又在 pause 后重新拉起 → 表现就是
-      // “暂停和开始不断重复”，同时控制台刷 AbortError（play() 被 pause() 打断）。
-      if (Math.abs((video.playbackRate || 1) - want) < 0.01) return;   // 已经是目标倍速，什么都不做
+      this._wantRate = want;
+      if (Math.abs((video.playbackRate || 1) - want) < 0.01) {   // 已经是目标倍速，什么都不做
+        this._speedFight = 0;
+        return;
+      }
       const nowMs = Date.now();
-      if (video === this._speedVideo && nowMs - (this._speedWriteAt || 0) < 2000) return;  // 2 秒内最多写一次
+      if (nowMs < (this._speedQuietUntil || 0)) return;                                  // 刚判定“被持续压制”，先安静一会儿
+      if (video === this._speedVideo && nowMs - (this._speedWriteAt || 0) < 2000) return; // 2 秒内最多写一次
+      if (nowMs - (this._speedFightStart || 0) > 60000) { this._speedFightStart = nowMs; this._speedFight = 0; }
+      if ((this._speedFight || 0) >= 12) {
+        this._speedQuietUntil = nowMs + 60000;
+        if (!this._speedWarned) {
+          this._speedWarned = true;
+          logger.warn('Video', `平台持续把倍速改回 ${video.playbackRate}x（脚本设置 ${want}x），暂停纠正 1 分钟后再试`);
+          this.ui.log(`⚠️ 平台持续压制倍速（实际 ${video.playbackRate}x），进度可能不计入；建议把倍速调回 1.0x`, 'warn');
+        }
+        return;
+      }
+      this._speedFight = (this._speedFight || 0) + 1;
       this._speedVideo = video;
       this._speedWriteAt = nowMs;
       try { video.playbackRate = want; } catch (e) {}
@@ -1743,12 +2139,11 @@ ${formatInst}
         if (!this.isHandling || !video) return;
         const got = video.playbackRate;
         if (Math.abs(got - want) > 0.05) {
-          this._platformSpeedLocked = true;
-          if (!this._speedWarned) {
-            this._speedWarned = true;
-            logger.warn('Video', `平台把倍速改成 ${got}x（脚本设置 ${want}x），疑似触发倍速限制，学习进度可能不计入`);
-            this.ui.log(`⚠️ 平台限制了倍速(${got}x)，进度可能不计入，建议把倍速调回 1.0x`, 'warn');
-          }
+          logger.debug('Video', `倍速被改回 ${got}x，稍后重试`);
+          this._speedWriteAt = 0;      // 允许立刻再纠正一轮
+          this._applySpeed(video);
+        } else {
+          this._speedFight = 0;        // 稳住了，计数归零
         }
       }, 1200);
     }
@@ -1885,7 +2280,7 @@ ${formatInst}
         video.muted = muted;
         if (muted) this._muteViaPlatform();
       }
-      if (video.playbackRate !== speed) this._applySpeed(video);
+      this._enforceRate(video);
 
       if (video.paused && !video.ended && this.isHandling) {
         this._playAttempts++;
@@ -2100,14 +2495,24 @@ ${formatInst}
 
     updateSpeed(speed) {
       this._speedWarned = false;   // 用户手动改了倍速，重新给一次检测机会
-      this._platformSpeedLocked = false;
-      if (this.currentVideo) this.currentVideo.playbackRate = speed;
-      document.querySelectorAll('video').forEach(v => { v.playbackRate = speed; });
+      this._speedQuietUntil = 0;
+      this._speedFight = 0;
+      this._speedFightStart = 0;
+      this._speedWriteAt = 0;
+      this._wantRate = speed;
+      const writeRate = (v) => {
+        try {
+          if (this._rateDesc) this._rateDesc.set.call(v, speed);
+          else v.playbackRate = speed;
+        } catch (e) {}
+      };
+      if (this.currentVideo) writeRate(this.currentVideo);
+      document.querySelectorAll('video').forEach(writeRate);
       try {
         document.querySelectorAll('iframe').forEach(iframe => {
           try {
             const doc = iframe.contentDocument || iframe.contentWindow?.document;
-            if (doc) doc.querySelectorAll('video').forEach(v => { v.playbackRate = speed; });
+            if (doc) doc.querySelectorAll('video').forEach(writeRate);
           } catch (e) {}
         });
       } catch (e) {}
@@ -5928,6 +6333,8 @@ ${formatInst}
       this._reportTimer = null;      // 平台上报队列(nhd)看门狗
       this._nhdSize = 0;             // 上次看到的 nhd 队列字节数（诊断用）
       this._nhdWarned = false;       // 是否已经提示过队列堆积
+      this._gapCheckedFor = '';      // 已核对过覆盖率的视频（src），防止同一段视频反复补播
+      this._gapAttempts = 0;         // 当前视频已核对/补播的轮次（最多 3 轮）
     }
 
     init() {
@@ -6007,6 +6414,8 @@ ${formatInst}
       this._navFailCount = 0;
       this._jumping = false;
       this._awaitingSince = 0;
+      this._gapCheckedFor = '';
+      this._gapAttempts = 0;
       this.ui.setRunning(true);
       this.ui.setStatus('运行中...', 'info');
       this.ui.log('🚀 开始自动学习');
@@ -6194,6 +6603,21 @@ ${formatInst}
           this.ui.setStatus('视频已播完，等待平台上报学习进度...', 'info');
           return;
         }
+        // ⭐ 结算前先核对「观看覆盖率」：平台只认它自己记的已观看区间，
+        // 覆盖率不足就按缺口补播（每段视频只补一轮），否则这个视频永远打不上钩。
+        const finSrc = this.videoHandler._finishedSrc || ('#' + endedAt);
+        // 同一段视频最多核对/补播 3 轮，避免覆盖率永远差一点点时死循环
+        if (this._gapCheckedFor !== finSrc && (this._gapAttempts || 0) < 3) {
+          this._gapCheckedFor = finSrc;
+          this._gapAttempts = (this._gapAttempts || 0) + 1;
+          this.ui.setStatus('正在核对观看覆盖率...', 'info');
+          const state = await this.videoHandler.fillGaps();
+          if (state === 'filled') {
+            this.videoHandler._endedAt = Date.now();   // 补播后重新静置，等平台重新结算
+            return;
+          }
+          return;   // 本轮先不跳，让下一轮带着结算结果再决定
+        }
         this._videoJustEnded = false;
         this.ui.updateVideoProgress(null);
         await this._jumpNextTask();
@@ -6286,6 +6710,8 @@ ${formatInst}
           // 新页面可能换了视频，重新接管
           this.videoHandler._awaitingNextVideo = false;
           this._awaitingSince = 0;
+          this._gapCheckedFor = '';   // 新视频重新核对覆盖率
+          this._gapAttempts = 0;
           this.videoHandler.scanAndHandle();
           this.quizHandler.scanQuizzes();
           return true;
