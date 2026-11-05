@@ -4,10 +4,10 @@ Based on original project: https://github.com/yu-xi-qin/-/blob
 # MODIFIED — 长江雨课堂自动刷课助手 改动记录
 
 > **基线版本**：v3.0.0（最初的原版脚本，5711 行，CRLF）
-> **当前版本**：v3.0.18（6894 行，与 `yk3.js` 工作副本逐字节一致）
-> **改动统计**：`+1294 / −111` 行，29 个改动块（不含行尾 CRLF→LF 的归一化）
+> **当前版本**：v3.0.19（6955 行，与 `yk3.js` 工作副本逐字节一致）
+> **改动统计**：`+1356 / −111` 行，29 个改动块（不含行尾 CRLF→LF 的归一化）
 > **部署形式**：Tampermonkey 脚本（单个 `.js`，文件名 `yuketang-automator.js`）
-> **说明**：本文按“版本 → 现象 → 根因 → 具体改动”记录，行号均指 **v3.0.18** 文件中的位置。
+> **说明**：本文按“版本 → 现象 → 根因 → 具体改动”记录，行号均指 **v3.0.19** 文件中的位置。
 
 ---
 
@@ -33,7 +33,8 @@ Based on original project: https://github.com/yu-xi-qin/-/blob
 | 3.0.15 | 倍速仍被页面压回 0.8x | 在 `<video>` 实例上改写 `playbackRate` 存取器，setter 一律落成面板值 | 被 3.0.18 加强 |
 | 3.0.16 | 覆盖率永远到不了 95% | 读 `/video-log/detail/` 的 `heartbeat.result`，按「已观看区间」补缺口 | 保留（3.0.17 修正） |
 | 3.0.17 | 3.0.16 的补播从未执行 | 直连接口取区间；接管视频时就核对，读不到才退回「拖回 0 秒」 | 保留 |
-| 3.0.18 | 页面绕过实例锁抢写倍速 | 原型 setter 强写 + `ratechange` 自愈 + 可见日志 | **当前版本** |
+| 3.0.18 | 页面绕过实例锁抢写倍速 | 原型 setter 强写 + `ratechange` 自愈 + 可见日志 | 保留 |
+| 3.0.19 | “完成度已到已完成，脚本还在傻播” | 补播结束封口（标记已播完/等待跳转/清空当前视频）+ 目录打钩即跳 + 按轮次补播 | **当前版本** |
 
 ---
 
@@ -298,6 +299,31 @@ GET /video-log/detail/?classroom_id=…&user_id=…&video_id=…
 
 ---
 
+---
+
+### v3.0.19 — 补播结束必须“封口”，并把“目录打钩”当成完成信号
+
+**现象**：3.0.18 之后覆盖率确实能补到完成，但出现怪象——「完成度已经跳到已完成，脚本还在继续工作」，白白重播已看过的片段。
+
+**根因**（五条，前三条同源）：
+1. `fillGaps()` 为了让补播能 `play()`，执行了 `_awaitingNextVideo=false`、`currentVideo=video`、`video._ykhFinished=false`，**补播结束没有还原**；
+2. `scanAndHandle()` 每 500ms 扫到「既没 `ended`、也没 `_ykhFinished`」的 `<video>`，把它当成正在播放的视频重新接管 → 从播放器恢复点线性重播已看片段；
+3. `hasActiveVideo()` 因此一直返回 true，主循环的跳转分支永远走不到；
+4. 补播后的覆盖率复核命中 `readCoverage()` 的 60 秒缓存，读到的是**补播前**的区间，判不出“补成功了”；
+5. 平台其实已经把目录行打钩（`icon-yuanquangou-mianzhuang`），但脚本从没用这个信号做判断。
+
+**改动**：
+- `fillGaps()` 新增内部 `seal()`：补播结束（`complete`/`done`/`stalled`/`skip`）一律把 `video._ykhFinished=true`、`_ykhFinishedSrc=video.src`、`_finishedEl/_finishedSrc` 记住、`_awaitingNextVideo=true`、`currentVideo=null`、`_endedAt=Date.now()`；
+- 返回值扩成 `complete / done / filled / stalled / unknown / skip`；补播后**清掉该 video_id 的覆盖率缓存**再读一次：涨了 → `filled`（允许再来一轮），到 99.5% 或 `completed=1` → `complete`，一点没涨 → `stalled`（记录“这一轮补不动”）；
+- 主循环：先查 `_currentLeafDone()`，目录已打钩就**不补播、直接跳**；否则按**轮次**补播（最多 3 轮，每轮重新读区间），非 `filled` 一律直接 `_jumpNextTask()`；
+- `_playSpan()` 每段**提前 5 秒起播**（`max(0, a-5)`）：seek 之后开头一两秒平台常不计入，早点进去把这部分损耗吃掉，顺带也修了 `1-13` 这类开头缺口；
+- 主循环补 `_awaitingSince` 时间戳同步：补播结束由视频处理器自己封口置锁时，若没有起始时间戳，25 秒自愈会立刻把锁解开、又去接管旧视频；
+- `unknown`（读不到区间）**不封口**：调用方还要退回“从头连续播放”，那之后必须能正常收到 `ended` 事件（这一条是被测试抓出来的）。
+
+**验证**：`yk3-test-coverage.js` 16 → **20** 项（补播后必须封口、补播后必须绕过缓存重读、`stalled`、`complete`、目录打钩直接跳过、提前 5 秒起播）；连同 video 12 / play 41 / nav 10 / nhd 9，**合计 92 项全通过**。
+
+---
+
 ## 3. 新增方法总表
 
 | 方法 | 所属类 | 行号 | 作用 |
@@ -305,26 +331,6 @@ GET /video-log/detail/?classroom_id=…&user_id=…&video_id=…
 | `_findPlayableVideo()` | VideoHandler | 1623 | 主文档 + 同源 iframe 中找第一个未播完的 video |
 | `_isFinishedVideo(v)` | VideoHandler | 1636 | 判断元素是否已播完（含 SPA 换源后自动失效） |
 | `_isNewVideo(v)` | VideoHandler | 1647 | 判断是否为新视频（元素/换源/已移除） |
-| `_applySpeed(video)` | VideoHandler | 2111 | 安全写倍速：值相同不写、2 秒限流、回读检测平台改写 |
-| `_tryStart(video)` | VideoHandler | 2180 | 启动播放：先 `play()`，失败退避重试 |
-| `_scheduleTryStart(video, delay)` | VideoHandler | 2211 | 延迟重试调度，≥3 次才点按钮，>6 次停手 |
-| `_findPlayButton()` | VideoHandler | 2233 | 找平台播放按钮（含可见性过滤） |
-| `_clickPlatformPlayButton()` | VideoHandler | 2255 | 只发一次 `click`，2 秒冷却 |
-| `_currentLeafDone()` | VideoHandler | 2296 | 当前目录行是否已打钩 |
-| `_playerRoot()` | VideoHandler | 2309 | 定位播放器容器 |
-| `_getProgressText()` | VideoHandler | 2320 | 只在播放器内读进度文本 |
-| `_nodeIdFromUrl()` | NavigationHandler | 5230 | 从 URL 取 `node_id` |
-| `_catalogLeaves()` | NavigationHandler | 5250 | 目录树所有可见行 |
-| `_leafTag/_leafTitle/_leafDone` | NavigationHandler | 5256/5262/5268 | 行的类型/标题/是否完成 |
-| `_currentLeafIndex(leaves)` | NavigationHandler | 5275 | 当前行下标（`.leaf-item.is-active`） |
-| `_didNavigate(urlBefore, mediaBefore)` | NavigationHandler | 5288 | SPA 下判断是否真的换了内容 |
-| `_clickNextInCatalog()` | NavigationHandler | 5296 | 目录树里点下一个未完成任务 |
-| `_clickPlayerNext()` | NavigationHandler | 5343 | 点播放器“下一节”按钮 |
-| `_clickNextByText()` | NavigationHandler | 5393 | 按文本找“下一节/下一个”兜底 |
-| `goToNextTask()` | NavigationHandler | 5439 | 四级跳转策略入口 |
-| `_jumpNextTask(force)` | Automator | 6688 | 跳转编排：防重入、失败计数、冷却、重新接管 |
-| `_startReportWatchdog()` | Automator | 6484 | `nhd` 队列看门狗（含 setItem patch） |
-| `_stopReportWatchdog()` | Automator | 6548 | 停止看门狗 |
 | `trimNhQueue(raw, 0.6)` | 顶层函数 | 173 | `nhd` 队列瘦身：解析后只保留最新 N%，失败返回 null |
 | `_installRateOverride(video)` | VideoHandler | 1777 | 在 `<video>` 实例上锁 `playbackRate`，setter 落成面板值 |
 | `_logRateWrite(v, want)` | VideoHandler | 1806 | 页面抢写倍速时打可见日志（2 秒节流） |
@@ -338,8 +344,28 @@ GET /video-log/detail/?classroom_id=…&user_id=…&video_id=…
 | `_fetchCoverageDirect()` | VideoHandler | 1953 | 直连 `/video-log/detail/` 取 `heartbeat` |
 | `readCoverage(timeoutMs)` | VideoHandler | 1983 | 三级读取：缓存 → 直连 → 点详情截获 |
 | `_computeGaps(result, length)` | VideoHandler | 2016 | 已观看区间合并后取补集（<3 秒忽略） |
-| `fillGaps(videoOverride)` | VideoHandler | 2044 | 按缺口补播，返回 `filled/done/unknown/skip` |
-| `_playSpan(video, a, b)` | VideoHandler | 2084 | 连续播完 [a,b] 这一段，中途不暂停 |
+| `fillGaps(videoOverride)` | VideoHandler | 2044 | 按缺口补播；内含 `seal()` 封口，返回 `complete/done/filled/stalled/unknown/skip` |
+| `_playSpan(video, a, b)` | VideoHandler | 2125 | 连续播完 [a,b]，提前 5 秒起播，中途不暂停 |
+| `_applySpeed(video)` | VideoHandler | 2155 | 安全写倍速：值相同不写、2 秒限流、回读检测平台改写 |
+| `_tryStart(video)` | VideoHandler | 2224 | 启动播放：先 `play()`，失败退避重试 |
+| `_scheduleTryStart(video, delay)` | VideoHandler | 2255 | 延迟重试调度，≥3 次才点按钮，>6 次停手 |
+| `_findPlayButton()` | VideoHandler | 2277 | 找平台播放按钮（含可见性过滤） |
+| `_clickPlatformPlayButton()` | VideoHandler | 2299 | 只发一次 `click`，2 秒冷却 |
+| `_currentLeafDone()` | VideoHandler | 2340 | 当前目录行是否已打钩（3.0.19 起也用作“直接跳”信号） |
+| `_playerRoot()` | VideoHandler | 2353 | 定位播放器容器 |
+| `_getProgressText()` | VideoHandler | 2364 | 只在播放器内读进度文本 |
+| `_nodeIdFromUrl()` | NavigationHandler | 5274 | 从 URL 取 `node_id` |
+| `_catalogLeaves()` | NavigationHandler | 5294 | 目录树所有可见行 |
+| `_leafTag/_leafTitle/_leafDone` | NavigationHandler | 5300/5306/5312 | 行的类型/标题/是否完成 |
+| `_currentLeafIndex(leaves)` | NavigationHandler | 5319 | 当前行下标（`.leaf-item.is-active`） |
+| `_didNavigate(urlBefore, mediaBefore)` | NavigationHandler | 5332 | SPA 下判断是否真的换了内容 |
+| `_clickNextInCatalog()` | NavigationHandler | 5340 | 目录树里点下一个未完成任务 |
+| `_clickPlayerNext()` | NavigationHandler | 5387 | 点播放器“下一节”按钮 |
+| `_clickNextByText()` | NavigationHandler | 5437 | 按文本找“下一节/下一个”兜底 |
+| `goToNextTask()` | NavigationHandler | 5483 | 四级跳转策略入口 |
+| `_jumpNextTask(force)` | Automator | 6750 | 跳转编排：防重入、失败计数、冷却、重新接管 |
+| `_startReportWatchdog()` | Automator | 6528 | `nhd` 队列看门狗（含 setItem patch） |
+| `_stopReportWatchdog()` | Automator | 6592 | 停止看门狗 |
 
 ### 新增状态字段
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         长江雨课堂自动刷课助手
 // @namespace    https://changjiang.yuketang.cn/
-// @version      3.0.18
+// @version      3.0.19
 // @description  自动刷视频、做试题，支持倍速播放与AI智能答题（判断题全文本回退）
 // @author       yuketang-helper
 // @match        https://changjiang.yuketang.cn/*
@@ -2046,18 +2046,39 @@ ${formatInst}
       const video = videoOverride || this._finishedEl || this.currentVideo;
       if (!video) return 'skip';
       this._gapFilling = true;
+      // 补播结束必须把“已播完”状态重新封回去。否则 scanAndHandle 会把这个 <video>
+      // 当成正在播放的视频重新接管，从播放器恢复点线性重播已经看完的部分 ——
+      // 覆盖率不再增长，主循环的跳转分支也永远走不到（用户实测：进度已判完成，脚本还在傻播）。
+      const seal = () => {
+        try {
+          video._ykhFinished = true;
+          video._ykhFinishedSrc = video.src;
+        } catch (e) {}
+        this._finishedEl = video;
+        this._finishedSrc = video.src;
+        this._awaitingNextVideo = true;
+        this.currentVideo = null;
+        this._endedAt = Date.now();
+      };
       try {
         const hb = await this.readCoverage();
-        if (!hb) { logger.info('Video', '读不到观看区间，本次不补播'); return 'unknown'; }
-        const rate = Number(hb.rate) || 0;
-        if (Number(hb.completed) === 1 || rate >= 0.995) {
-          logger.info('Video', `覆盖率 ${(rate * 100).toFixed(1)}%，无需补播`);
-          return 'done';
+        if (!hb) {
+          // 读不到区间时不要封口：调用方可能退回“从头连续播”，
+          // 那之后还必须能正常收到 ended 事件。
+          logger.info('Video', '读不到观看区间，本次不补播');
+          return 'unknown';
         }
+        const rate = Number(hb.rate) || 0;
         const len = Number(hb.video_length) || video.duration || 0;
+        if (Number(hb.completed) === 1 || rate >= 0.995 || this._currentLeafDone()) {
+          logger.info('Video', `覆盖率 ${(rate * 100).toFixed(1)}%，无需补播`);
+          seal();
+          return 'complete';
+        }
         const gaps = this._computeGaps(hb.result, len);
         if (!gaps.length) {
           logger.info('Video', `覆盖率 ${(rate * 100).toFixed(1)}%，算不出缺口（可能只差末尾几秒），交给平台结算`);
+          seal();
           return 'done';
         }
         const desc = gaps.map((g) => `${g[0].toFixed(0)}-${g[1].toFixed(0)}s`).join('、');
@@ -2065,15 +2086,35 @@ ${formatInst}
         this.ui.log(`🔧 覆盖率 ${(rate * 100).toFixed(1)}%，开始补播 ${gaps.length} 段未观看内容`, 'warn');
         // 允许再次播放这个「已结束」的视频
         this._awaitingNextVideo = false;
+        this._gapSeeking = false;
         this.currentVideo = video;
         video._ykhFinished = false;
         this._applySpeed(video);
         for (const g of gaps) {
-          if (!this.isHandling) return 'skip';
+          if (!this.isHandling) break;
           await this._playSpan(video, g[0], g[1]);
         }
-        this.ui.log('✅ 未观看区间已补播，等待平台重新计算覆盖率', 'info');
+        seal();
+        if (!this.isHandling) return 'skip';
+        this.ui.log('✅ 未观看区间已补播，正在复核覆盖率…', 'info');
         await DOM.sleep(3000);
+        // 复核前必须清掉 60 秒缓存，否则读到的是补播之前的旧区间
+        const vid = this._currentVideoId();
+        if (vid && this._coverageAt) this._coverageAt[vid] = 0;
+        const after = await this.readCoverage(8000);
+        if (!after) return 'filled';
+        const r2 = Number(after.rate) || 0;
+        if (Number(after.completed) === 1 || r2 >= 0.995) {
+          logger.info('Video', `补播后覆盖率 ${(r2 * 100).toFixed(1)}%，平台已判定完成`);
+          this.ui.log(`🎉 覆盖率补到 ${(r2 * 100).toFixed(1)}%，平台已判定完成`, 'info');
+          return 'complete';
+        }
+        logger.info('Video', `补播后覆盖率 ${(rate * 100).toFixed(1)}% → ${(r2 * 100).toFixed(1)}%`);
+        if (r2 <= rate + 0.02) {
+          logger.warn('Video', `补播后覆盖率没有增长（停在 ${(r2 * 100).toFixed(1)}%），这一轮补不动，先跳过该视频`);
+          this.ui.log(`⚠️ 补播后覆盖率没有增长（${(r2 * 100).toFixed(1)}%），先跳过该视频`, 'warn');
+          return 'stalled';
+        }
         return 'filled';
       } finally {
         this._gapFilling = false;
@@ -2084,7 +2125,10 @@ ${formatInst}
     async _playSpan(video, a, b) {
       if (!video) return;
       this._gapSeeking = true;
-      try { video.currentTime = Math.max(0, a + 0.5); } catch (e) {}
+      // 提前 5 秒起播：seek 之后开头那一两秒平台常常不计入观看区间，
+      // 早点进去可以把这段损耗吃掉；反正这几秒本来就是已看过的内容。
+      const lead = Math.min(5, Math.max(0, a));
+      try { video.currentTime = Math.max(0, a - lead + 0.2); } catch (e) {}
       try { await video.play(); } catch (e) {}
       this._gapSeeking = false;
       const endAt = Math.max(a + 1, b - 0.3);
@@ -6562,6 +6606,12 @@ ${formatInst}
       // 关闭弹窗
       await this.navHandler.dismissModals();
 
+      // 补播结束后视频处理器会自己封口并置上“等待跳转”，这里补一个起始时间戳；
+      // 否则下面的 25 秒自愈会以为它卡住了，把锁解开又去接管旧视频（线性重播）。
+      if (this.videoHandler._awaitingNextVideo && this._awaitingSince === 0) {
+        this._awaitingSince = Date.now();
+      }
+
       // 自愈：等待跳转的状态卡太久（点击被页面吞掉/目录树还没渲染完），
       // 解除视频锁重新扫描，否则会一直以为"在等下一个视频"而什么都不做
       if (this.videoHandler._awaitingNextVideo && !this._jumping &&
@@ -6603,20 +6653,32 @@ ${formatInst}
           this.ui.setStatus('视频已播完，等待平台上报学习进度...', 'info');
           return;
         }
+        // 目录已经打钩 → 平台已经认定完成，别在覆盖率上继续纠缠，直接跳
+        if (this.videoHandler._currentLeafDone()) {
+          logger.info('Video', '目录已打钩，跳过覆盖率核对直接跳下一个');
+          this._videoJustEnded = false;
+          this._gapAttempts = 0;
+          this.ui.updateVideoProgress(null);
+          await this._jumpNextTask();
+          return;
+        }
         // ⭐ 结算前先核对「观看覆盖率」：平台只认它自己记的已观看区间，
-        // 覆盖率不足就按缺口补播（每段视频只补一轮），否则这个视频永远打不上钩。
-        const finSrc = this.videoHandler._finishedSrc || ('#' + endedAt);
-        // 同一段视频最多核对/补播 3 轮，避免覆盖率永远差一点点时死循环
-        if (this._gapCheckedFor !== finSrc && (this._gapAttempts || 0) < 3) {
-          this._gapCheckedFor = finSrc;
+        // 覆盖率不足就按缺口补播；同一段视频最多补 3 轮（每轮都重新读区间），
+        // 避免“永远差一点点”时死循环。
+        if ((this._gapAttempts || 0) < 3) {
           this._gapAttempts = (this._gapAttempts || 0) + 1;
-          this.ui.setStatus('正在核对观看覆盖率...', 'info');
+          this.ui.setStatus(`正在核对观看覆盖率（第 ${this._gapAttempts}/3 轮）...`, 'info');
           const state = await this.videoHandler.fillGaps();
           if (state === 'filled') {
-            this.videoHandler._endedAt = Date.now();   // 补播后重新静置，等平台重新结算
+            this.videoHandler._endedAt = Date.now();   // 补播过 → 再静置一轮等平台结算，然后再核对
             return;
           }
-          return;   // 本轮先不跳，让下一轮带着结算结果再决定
+          // complete / done / stalled / unknown / skip → 补播帮不上忙了，直接跳下一个
+          logger.info('Video', `覆盖率核对结论：${state}，跳到下一个任务`);
+          this._videoJustEnded = false;
+          this.ui.updateVideoProgress(null);
+          await this._jumpNextTask();
+          return;
         }
         this._videoJustEnded = false;
         this.ui.updateVideoProgress(null);
